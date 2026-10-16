@@ -24,7 +24,6 @@ concurrency: release
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   AWS_REGION: us-west-2
@@ -51,6 +50,10 @@ jobs:
     name: Publish image and chart
     needs: test
     runs-on: ubuntu-latest
+    # Only this job joins Teleport (GitHub OIDC); `test` runs repository code without it.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
