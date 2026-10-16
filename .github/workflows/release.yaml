@@ -1,64 +1,107 @@
-name: Release
+name: Release (Maestra)
+
+# Publishes the plugin image and Helm chart of a Maestra release to the
+# us-west-2 ECR. A release is a branch maestra/vX.Y.Z (the upstream tag plus
+# our patch stack) and an annotated tag vX.Y.Z-maestra.N on it:
+#   image  515260921971.dkr.ecr.us-west-2.amazonaws.com/cnpg-plugin-wal-g:vX.Y.Z-maestra.N
+#   chart  oci://515260921971.dkr.ecr.us-west-2.amazonaws.com/helm-charts/cnpg-plugin-wal-g
+#          version X.Y.Z-maestra.N, appVersion vX.Y.Z-maestra.N
+#
+# Replaces upstream's release.yaml (GitHub release + ghcr.io/wal-g push),
+# which cannot publish from this fork.
+#
+# Auth: Teleport workload identity, no static AWS keys. The tag ref is not
+# main/master, so the org-wide image-push-github-actions-maestra-io token does
+# not admit it; the per-repo token image-push-github-actions-cnpg-plugin-wal-g
+# (maestra-io/fluxcd image-push-workload-identity.yaml) does.
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*-maestra.*'
+
+concurrency: release
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
+  IMAGE_REPOSITORY: cnpg-plugin-wal-g
+  TELEPORT_TOKEN: image-push-github-actions-cnpg-plugin-wal-g
 
 jobs:
-  # Prevents race conditions by creating the release only once before uploads.
-  create-release:
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          draft: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
 
-  build-release-packages:
-    needs: create-release
-    name: Build and push release packages
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tests
+        run: make test
 
-      - name: Set up Helm
-        uses: azure/setup-helm@v4.3.0
-        with:
-          version: 'latest'
+  publish:
+    name: Publish image and chart
+    needs: test
+    runs-on: ubuntu-latest
+    # Only this job joins Teleport (GitHub OIDC); `test` runs repository code without it.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-      - name: Set up docker buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Package and push release packages
-        run: |
-          make release
+      - name: Resolve versions
+        id: version
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # vX.Y.Z-maestra.N: the image tag keeps the v, the chart version drops it.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-maestra\.[0-9]+$ ]] || { echo "::error::tag $TAG is not vX.Y.Z-maestra.N"; exit 1; }
+          echo "image-tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "chart-version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # linux/amd64 only: every Maestra cluster is x86-64.
+      - name: Build image
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image-tag }}
+        run: |
+          docker build --target=runtime \
+            --build-arg GIT_TAG="${IMAGE_TAG}" \
+            --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            --label org.opencontainers.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "local/${IMAGE_REPOSITORY}:${IMAGE_TAG}" .
+          docker run --rm --entrypoint /usr/local/bin/cnpg-plugin-wal-g "local/${IMAGE_REPOSITORY}:${IMAGE_TAG}" version
+          docker run --rm --entrypoint /usr/local/bin/wal-g "local/${IMAGE_REPOSITORY}:${IMAGE_TAG}" --version
+
+      - name: Push image to ECR
+        uses: maestra-io/github-actions/push-to-aws-ecr-repository@main
+        with:
+          awsRegion: ${{ env.AWS_REGION }}
+          repositories: ${{ env.IMAGE_REPOSITORY }}
+          localTag: ${{ steps.version.outputs.image-tag }}
+          targetTag: ${{ steps.version.outputs.image-tag }}
+          teleportToken: ${{ env.TELEPORT_TOKEN }}
+
+      # The chart defaults image.repository to ghcr.io/wal-g; the published
+      # chart points at the image this run pushed (tag = appVersion).
+      - name: Point the chart at the ECR image
+        run: |
+          yq -i ".image.repository = \"${ECR_REGISTRY}/${IMAGE_REPOSITORY}\"" chart/values.yaml
+          yq '.image' chart/values.yaml
+
+      - name: Push chart to ECR
+        uses: maestra-io/github-actions/push-helm-chart-to-aws-ecr@main
+        with:
+          chartPath: chart
+          version: ${{ steps.version.outputs.chart-version }}
+          appVersion: ${{ steps.version.outputs.image-tag }}
+          awsRegion: ${{ env.AWS_REGION }}
+          teleportToken: ${{ env.TELEPORT_TOKEN }}

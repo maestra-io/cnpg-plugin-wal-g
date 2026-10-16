@@ -144,6 +144,69 @@ var _ = Describe("WAL-G Config Integration Tests", func() {
 			Expect(envMap["WALG_DELTA_MAX_STEPS"]).To(Equal("5"))
 			Expect(envMap["WALG_LIBSODIUM_KEY"]).To(Equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
 			Expect(envMap["WALG_LIBSODIUM_KEY_TRANSFORM"]).To(Equal("hex"))
+			Expect(envMap).NotTo(HaveKey("AWS_SESSION_TOKEN"))
+		})
+
+		It("should export AWS_SESSION_TOKEN when sessionToken is set", func() {
+			backupConfig := &v1beta1.BackupConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-backup-config",
+					Namespace: namespace,
+				},
+				Spec: v1beta1.BackupConfigSpec{
+					Storage: v1beta1.StorageConfig{
+						StorageType: v1beta1.StorageTypeS3,
+						S3: &v1beta1.S3StorageConfig{
+							Prefix:      "s3://test-bucket/sts-prefix",
+							Region:      "auto",
+							EndpointURL: "https://account.r2.cloudflarestorage.com",
+							AccessKeyIDRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "sts-credentials"},
+								Key:                  "access_key_id",
+							},
+							AccessKeySecretRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "sts-credentials"},
+								Key:                  "secret_access_key",
+							},
+							SessionTokenRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "sts-credentials"},
+								Key:                  "session_token",
+							},
+						},
+					},
+				},
+			}
+
+			stsSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sts-credentials",
+					Namespace: namespace,
+				},
+				Data: map[string][]byte{
+					"access_key_id":     []byte("sts-access-key-id"),
+					"secret_access_key": []byte("sts-secret-access-key"),
+					"session_token":     []byte("sts-session-token"),
+				},
+			}
+
+			fakeClient = fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(stsSecret).
+				Build()
+
+			configWithSecrets, err := backupConfig.PrefetchSecretsData(ctx, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+
+			walgConfig := NewConfigFromBackupConfig(configWithSecrets, 17)
+			Expect(walgConfig.AWSAccessKeyID).To(Equal("sts-access-key-id"))
+			Expect(walgConfig.AWSSecretAccessKey).To(Equal("sts-secret-access-key"))
+			Expect(walgConfig.AWSSessionToken).To(Equal("sts-session-token"))
+
+			envMap := walgConfig.ToEnvMap()
+			Expect(envMap["AWS_ACCESS_KEY_ID"]).To(Equal("sts-access-key-id"))
+			Expect(envMap["AWS_SECRET_ACCESS_KEY"]).To(Equal("sts-secret-access-key"))
+			Expect(envMap["AWS_SESSION_TOKEN"]).To(Equal("sts-session-token"))
+			Expect(envMap["AWS_REGION"]).To(Equal("auto"))
 		})
 
 		It("should generate correct wal-g config from BackupConfig with Secret references", func() {

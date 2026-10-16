@@ -876,5 +876,46 @@ var _ = Describe("BackupConfig Secrets", func() {
 			Expect(configWithSecrets.BackupConfig.Name).To(Equal("test-backup-config"))
 			Expect(configWithSecrets.BackupConfig.Namespace).To(Equal(namespace))
 		})
+
+		It("should leave SessionToken empty when sessionToken is not set", func() {
+			configWithSecrets, err := backupConfig.PrefetchSecretsData(ctx, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(configWithSecrets.Spec.Storage.S3.SessionToken).To(BeEmpty())
+		})
+
+		It("should prefetch the session token from the referenced Secret", func() {
+			tokenSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sts-credentials",
+					Namespace: namespace,
+				},
+				Data: map[string][]byte{
+					"session_token": []byte("test-session-token"),
+				},
+			}
+			Expect(fakeClient.Create(ctx, tokenSecret)).To(Succeed())
+
+			backupConfig.Spec.Storage.S3.SessionTokenRef = &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "sts-credentials"},
+				Key:                  "session_token",
+			}
+
+			configWithSecrets, err := backupConfig.PrefetchSecretsData(ctx, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(configWithSecrets.Spec.Storage.S3.AccessKeyID).To(Equal("test-access-key"))
+			Expect(configWithSecrets.Spec.Storage.S3.AccessKeySecret).To(Equal("test-secret-key"))
+			Expect(configWithSecrets.Spec.Storage.S3.SessionToken).To(Equal("test-session-token"))
+		})
+
+		It("should return error when the sessionToken Secret key does not exist", func() {
+			backupConfig.Spec.Storage.S3.SessionTokenRef = &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "test-secret"},
+				Key:                  "missing-session-token",
+			}
+
+			_, err := backupConfig.PrefetchSecretsData(ctx, fakeClient)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("missing key missing-session-token"))
+		})
 	})
 })

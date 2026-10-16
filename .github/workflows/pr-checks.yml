@@ -1,0 +1,14 @@
+# Secret scan of the PR's own commits on every pull request:
+# maestra-io/github-actions pr-checks.yml, gitleaks only.
+name: pr-checks
+
+on: pull_request
+
+jobs:
+  checks:
+    uses: maestra-io/github-actions/.github/workflows/pr-checks.yml@main
+    permissions:
+      contents: read
+    with:
+      check-encoding: false
+      kustomize: false
