@@ -25,11 +25,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// s3StorageConfigWithSecrets defines S3-specific configuration with embedded secrets data (AccessKeyID && AccessKeySecret)
+// s3StorageConfigWithSecrets defines S3-specific configuration with embedded secrets data (AccessKeyID, AccessKeySecret, SessionToken)
 type S3StorageConfigWithSecrets struct {
 	S3StorageConfig
 	AccessKeyID     string
 	AccessKeySecret string
+	SessionToken    string // Optional session token for temporary (STS-style) credentials
 	CACertData      string // Custom CA certificate data for S3 endpoint
 	// Resolved values from references
 	ResolvedPrefix      string // Resolved value from Prefix or PrefixFrom
@@ -176,6 +177,14 @@ func (b *BackupConfig) makeS3StorageConfigWithPrefilledSecrets(
 		return nil, err
 	}
 
+	var sessionToken []byte
+	if b.Spec.Storage.S3.SessionTokenRef != nil {
+		sessionToken, err = extractValueFromSecret(ctx, c, b.Spec.Storage.S3.SessionTokenRef, b.Namespace)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Create a deep copy of the S3StorageConfig to preserve all fields, including CustomCA
 	s3Config := b.Spec.Storage.S3.DeepCopy()
 
@@ -228,6 +237,7 @@ func (b *BackupConfig) makeS3StorageConfigWithPrefilledSecrets(
 		S3StorageConfig:     *s3Config,
 		AccessKeyID:         string(accessKeyID),
 		AccessKeySecret:     string(accessKeySecret),
+		SessionToken:        string(sessionToken),
 		CACertData:          caCertData,
 		ResolvedPrefix:      resolvedPrefix,
 		ResolvedRegion:      resolvedRegion,
