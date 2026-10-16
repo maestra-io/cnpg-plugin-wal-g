@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'maestra/**' ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, 'maestra/**' ]
 
 jobs:
   lint:
@@ -43,6 +43,31 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  manifests:
+    name: Generated files up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Regenerate CRDs, RBAC and deepcopy
+        run: make manifests generate
+
+      - name: Fail on drift
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            git diff
+            echo "::error::generated files are stale: run 'make manifests generate' and commit the result"
+            exit 1
+          fi
 
   build:
     name: Build
