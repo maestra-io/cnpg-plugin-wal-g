@@ -332,6 +332,13 @@ func reconcilePodSpecWithPluginSidecar(
 	return nil
 }
 
+// sidecarStartupProbeScript is the startupProbe's shell script; $0 is the
+// plugin binary. See sidecarStartupProbe.
+const sidecarStartupProbeScript = `out=$("$0" healthcheck 2>&1) && exit 0
+case "$out" in *'unknown command "healthcheck"'*) exit 0 ;; esac
+printf '%s\n' "$out" >&2
+exit 1`
+
 // sidecarStartupProbe gates the Pod's main containers on the instance plugin's
 // CNPG-I socket. The kubelet starts the main containers only after a native
 // sidecar's startupProbe has succeeded, and the instance manager loads the
@@ -341,11 +348,21 @@ func reconcilePodSpecWithPluginSidecar(
 //
 // It probes every 2s (the main containers wait at most ~2s past the socket),
 // and after 3 minutes without an answer the kubelet restarts the sidecar.
+//
+// The probe runs in the sidecar image, which --cnpg-i-pg-sidecar-image may set
+// to an older build than this operator's: one without the `healthcheck`
+// subcommand. Exec'ing it directly would then fail forever and, because the
+// kubelet waits for a native sidecar's startupProbe, keep postgres from ever
+// starting. So the probe checks the capability where it runs: when the binary
+// answers `unknown command "healthcheck"` (cobra's error for a missing
+// subcommand) it succeeds at once, the pre-probe behavior; every other
+// failure of the check fails the probe and is printed for the kubelet event.
 func sidecarStartupProbe() *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
-				Command: []string{common.PluginBinaryPath, "healthcheck"},
+				// $0 is the plugin binary (the argument after the script).
+				Command: []string{"/bin/sh", "-c", sidecarStartupProbeScript, common.PluginBinaryPath},
 			},
 		},
 		PeriodSeconds:    2,
