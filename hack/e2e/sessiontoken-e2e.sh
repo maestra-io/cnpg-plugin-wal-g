@@ -8,10 +8,11 @@
 #     - continuous WAL archiving with an STS triple (key, secret, session token)
 #     - backup-push through a plugin Backup
 #     - wal-g backup-list and wal-verify run in the sidecar (as the chart's archive check does)
-#     - credential rotation: a new STS triple written into the Secret in place, no restart,
-#       then archiving and a second Backup with it
+#     - credential rotation: a new STS triple written into the Secret in place, no restart;
+#       the old triple is then revoked (its parent user removed), so archiving and the
+#       second Backup can only succeed if the running plugin picked up the new one
 #     - restore through the plugin into a new Cluster, replaying WAL archived after the backup
-#   negative control (namespace pg-neg, same Secret, BackupConfig WITHOUT sessionToken)
+#   negative control (namespace pg-neg, a valid STS triple, BackupConfig WITHOUT sessionToken)
 #     - archiving fails with an S3 auth error, archived_count stays 0, a Backup fails
 #
 # Needs: docker (IMAGE already built), kind, kubectl, helm, aws (CLI v2), jq.
@@ -32,6 +33,9 @@ MINIO_ROOT_USER=minioadmin
 MINIO_ROOT_PASSWORD=minioadmin-e2e-pass
 WALG_USER=walguser
 WALG_PASSWORD=walguser-e2e-pass
+# Parent of pg-pos' first STS triple only: removed at rotation to revoke that triple.
+WALG_USER_OLD=walguser-old
+WALG_PASSWORD_OLD=walguser-old-e2e-pass
 PF_PORT=19000
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
@@ -94,11 +98,26 @@ cluster_condition() { # cluster_condition <ns> <cluster> <type> -> "status|reaso
 
 backup_phase() { kubectl -n "$1" get backups.postgresql.cnpg.io "$2" -o jsonpath='{.status.phase}' 2>/dev/null; }
 
-mint_sts() { # prints "key secret token" of a fresh MinIO STS AssumeRole triple
-    AWS_ACCESS_KEY_ID=$WALG_USER AWS_SECRET_ACCESS_KEY=$WALG_PASSWORD AWS_SESSION_TOKEN='' \
+mint_sts() { # mint_sts [user password]: prints "key secret token" of a fresh MinIO STS AssumeRole triple
+    AWS_ACCESS_KEY_ID=${1:-$WALG_USER} AWS_SECRET_ACCESS_KEY=${2:-$WALG_PASSWORD} AWS_SESSION_TOKEN='' \
         aws sts assume-role --endpoint-url "http://127.0.0.1:$PF_PORT" --region us-east-1 \
         --role-arn arn:xxx:xxx:xxx:xxxx --role-session-name walg-e2e --duration-seconds 3600 \
         --output json | jq -r '.Credentials | "\(.AccessKeyId) \(.SecretAccessKey) \(.SessionToken)"'
+}
+
+s3_ls_with() { # s3_ls_with <key> <secret> <token>: succeeds iff MinIO accepts the triple
+    AWS_ACCESS_KEY_ID=$1 AWS_SECRET_ACCESS_KEY=$2 AWS_SESSION_TOKEN=$3 \
+        aws s3 ls "s3://$BUCKET/" --endpoint-url "http://127.0.0.1:$PF_PORT" --region us-east-1 >/dev/null 2>&1
+}
+
+s3_rejects() { ! s3_ls_with "$@"; }
+
+# Succeeds once the config the plugin resolves for <backupconfig> carries <access key>.
+plugin_resolves_key() { # plugin_resolves_key <ns> <pod> <backupconfig> <access key>
+    kubectl -n "$1" exec "$2" -c plugin-wal-g -- bash -c '
+        d=$(mktemp -d); trap "rm -rf $d" EXIT
+        cnpg-plugin-wal-g dump-config "$1" "$2" -o "$d/walg.json" >/dev/null && grep -qF -- "$3" "$d/walg.json"' \
+        walg "$1/$3" "$PG_MAJOR" "$4"
 }
 
 apply_creds_secret() { # apply_creds_secret <ns> <key> <secret> <token>
@@ -212,21 +231,25 @@ mc_in() { kubectl -n minio exec deploy/minio -- mc --config-dir /tmp/mc "$@"; } 
 # which refused `mc alias set` right after rollout status in one CI run). Every
 # step is idempotent; policy attach errors when the policy is already attached,
 # so that case is accepted via `user info`.
+minio_user() { # minio_user <user> <password>: a readwrite user that may AssumeRole
+    mc_in admin user add local "$1" "$2" &&
+    { mc_in admin policy attach local readwrite --user "$1" ||
+      mc_in admin user info local "$1" | grep -qw readwrite; }
+}
 minio_setup() {
     mc_in alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
     mc_in mb --ignore-existing "local/$BUCKET" &&
-    mc_in admin user add local "$WALG_USER" "$WALG_PASSWORD" &&
-    { mc_in admin policy attach local readwrite --user "$WALG_USER" ||
-      mc_in admin user info local "$WALG_USER" | grep -qw readwrite; }
+    minio_user "$WALG_USER" "$WALG_PASSWORD" &&
+    minio_user "$WALG_USER_OLD" "$WALG_PASSWORD_OLD"
 }
-wait_for "MinIO bucket + AssumeRole user" 120 minio_setup
+wait_for "MinIO bucket + AssumeRole users" 120 minio_setup
 
 kubectl -n minio port-forward svc/minio "$PF_PORT:9000" >/tmp/minio-pf.log 2>&1 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true' EXIT
 wait_for "MinIO port-forward" 60 curl -sf "http://127.0.0.1:$PF_PORT/minio/health/live"
 
-read -r KEY1 SECRET1 TOKEN1 <<<"$(mint_sts)"
+read -r KEY1 SECRET1 TOKEN1 <<<"$(mint_sts "$WALG_USER_OLD" "$WALG_PASSWORD_OLD")"
 [ -n "$TOKEN1" ] || fail "MinIO STS returned no session token"
 log "STS triple #1: key=$KEY1 token_len=${#TOKEN1}"
 # The temporary key alone must be rejected: the shape of R2's Vault-minted credentials.
@@ -242,9 +265,15 @@ helm upgrade --install cnpg-plugin-wal-g "$REPO_ROOT/chart" -n cnpg-system \
     --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=Never --wait --timeout 300s
 kubectl -n cnpg-system rollout status deploy/cnpg-plugin-wal-g-controller-manager --timeout=300s
 
+# pg-neg gets its own triple from WALG_USER: revoking triple #1 at rotation must not
+# change why the negative control fails (missing token, not a revoked key).
+read -r KEYN SECRETN TOKENN <<<"$(mint_sts)"
+[ -n "$TOKENN" ] || fail "MinIO STS returned no session token for the pg-neg triple"
+kubectl create namespace pg-pos
+apply_creds_secret pg-pos "$KEY1" "$SECRET1" "$TOKEN1"
+kubectl create namespace pg-neg
+apply_creds_secret pg-neg "$KEYN" "$SECRETN" "$TOKENN"
 for ns in pg-pos pg-neg; do
-    kubectl create namespace "$ns"
-    apply_creds_secret "$ns" "$KEY1" "$SECRET1" "$TOKEN1"
     kubectl -n "$ns" create secret generic walg-encryption --from-literal=libsodiumKey="$(openssl rand -hex 32)"
 done
 backup_config pg-pos walg pg-pos true
@@ -283,23 +312,32 @@ jq -e '[.[] | .status] | length >= 2 and all(. != "FAILURE")' /tmp/wal-verify.js
 pass "wal-g wal-verify integrity timeline (in the sidecar): $(jq -c 'to_entries | map("\(.key)=\(.value.status)") | join(" ")' /tmp/wal-verify.json)"
 
 # Rotation, as VSO does it: a fresh triple written into the same Secret, no pod restart.
+# Then triple #1 is revoked, so from here on archiving and backup-2 can only succeed
+# if the running plugin (its watch cache of the Secret) uses triple #2.
 read -r KEY2 SECRET2 TOKEN2 <<<"$(mint_sts)"
+[ -n "$TOKEN2" ] || fail "MinIO STS returned no session token for triple #2"
 [ "$KEY2" != "$KEY1" ] || fail "STS returned the same key twice"
-apply_creds_secret pg-pos "$KEY2" "$SECRET2" "$TOKEN2"
 restarts_before=$(kubectl -n pg-pos get pod pg-1 -o jsonpath='{.status.initContainerStatuses[?(@.name=="plugin-wal-g")].restartCount}')
+apply_creds_secret pg-pos "$KEY2" "$SECRET2" "$TOKEN2"
+wait_for "plugin config resolves rotated key" 120 plugin_resolves_key pg-pos pg-1 walg "$KEY2"
+mc_in admin user remove local "$WALG_USER_OLD"
+wait_for "triple #1 revoked" 60 s3_rejects "$KEY1" "$SECRET1" "$TOKEN1"
+s3_ls_with "$KEY2" "$SECRET2" "$TOKEN2" || fail "triple #2 rejected after revoking triple #1"
+IFS='|' read -r before failed_before _ <<<"$(archiver_stats pg-pos pg-1)"
 psql_in pg-pos pg-1 "insert into e2e values ('row-2-after-rotation')"
-before=$archived
 psql_in pg-pos pg-1 "select pg_switch_wal()" >/dev/null
-wait_for "pg-pos archives with rotated creds" 300 bash -c "[[ \$(kubectl -n pg-pos exec pg-1 -c postgres -- psql -U postgres -qtAX -c 'select archived_count from pg_stat_archiver') -gt $before ]]"
+wait_for "pg-pos archives with rotated creds (triple #1 revoked)" 300 bash -c "[[ \$(kubectl -n pg-pos exec pg-1 -c postgres -- psql -U postgres -qtAX -c 'select archived_count from pg_stat_archiver') -gt $before ]]"
 plugin_backup pg-pos backup-2 pg
 wait_for "Backup backup-2 completed" 600 bash -c "[[ \$(kubectl -n pg-pos get backups.postgresql.cnpg.io backup-2 -o jsonpath='{.status.phase}') =~ ^(completed|failed)$ ]]"
 [ "$(backup_phase pg-pos backup-2)" = completed ] || fail "backup-2 phase=$(backup_phase pg-pos backup-2)"
 B2=$(kubectl -n pg-pos get backups.postgresql.cnpg.io backup-2 -o jsonpath='{.status.backupId}')
 IFS='|' read -r archived failed last_ok _ <<<"$(archiver_stats pg-pos pg-1)"
-[ "$failed" = 0 ] || fail "pg-pos failed_count=$failed after rotation"
+# Attempts between the revoke and the watch delivering the new Secret may fail and are
+# retried; a plugin that never picks up triple #2 cannot pass the archive wait above.
+rot_failed=$((failed - failed_before))
 restarts_after=$(kubectl -n pg-pos get pod pg-1 -o jsonpath='{.status.initContainerStatuses[?(@.name=="plugin-wal-g")].restartCount}')
 [ "$restarts_after" = "$restarts_before" ] || fail "sidecar restarted during rotation ($restarts_before -> $restarts_after)"
-pass "rotation (key $KEY1 -> $KEY2 in place, sidecar restarts unchanged=$restarts_after): archived_count=$archived failed_count=0, backup-2 completed backupId=$B2"
+pass "rotation (key $KEY1 -> $KEY2 in place, triple #1 revoked, sidecar restarts unchanged=$restarts_after): archived_count $before -> $archived, failed during rotation=$rot_failed, backup-2 completed backupId=$B2"
 
 # A row only in WAL archived after backup-2: the restore must replay it.
 psql_in pg-pos pg-1 "insert into e2e values ('row-3-wal-only')"
