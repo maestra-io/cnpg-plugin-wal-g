@@ -36,9 +36,10 @@ type Client struct {
 	watchedGVKs    map[string]bool           // read only once init
 	watchedObjects map[string]*watchedObject // mutex'ed
 	wmut           sync.RWMutex              // for watchedObjects map
-	// cmut serializes cache-miss handling so concurrent misses on one key start ONE watch.
+	// cmut (capacity 1) serializes cache-miss handling so concurrent misses on one key start ONE
+	// watch; a channel, not a Mutex, so a waiting caller still honours its ctx.
 	// ponytail: one lock for all keys; a sidecar caches a handful of objects, so per-key locks buy nothing.
-	cmut sync.Mutex
+	cmut chan struct{}
 	// startWatch opens the per-object watch; a field so tests can count watches.
 	startWatch func(ctx context.Context, mapping *meta.RESTMapping, key client.ObjectKey) (watch.Interface, error)
 	ctx        context.Context // context for long-running operations (ex. Watch requests)
@@ -70,6 +71,7 @@ func CreateClient(ctx context.Context, mgr manager.Manager, cachedObjectTypes []
 		mapper:         mgr.GetRESTMapper(),
 		watchedObjects: make(map[string]*watchedObject),
 		ctx:            ctx,
+		cmut:           make(chan struct{}, 1),
 	}
 	c.startWatch = c.typedWatch
 	return c, nil
@@ -118,8 +120,12 @@ func (c *Client) getAndCreateWatchIfNeeded(
 		return objKey, err
 	}
 
-	c.cmut.Lock()
-	defer c.cmut.Unlock()
+	select {
+	case c.cmut <- struct{}{}:
+	case <-ctx.Done():
+		return objKey, ctx.Err()
+	}
+	defer func() { <-c.cmut }()
 	// Another goroutine may have started the watch while we waited for the lock.
 	if hit, err := c.getFromCache(objKey, gvk, key, obj); hit {
 		return objKey, err
