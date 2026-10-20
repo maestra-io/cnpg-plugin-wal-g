@@ -19,13 +19,17 @@ package resourcecachingclient
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -495,6 +499,87 @@ var _ = Describe("ResourceCachingClient", func() {
 				objKey := gvk.String() + "|" + key.String()
 				return cachingClient.watchedObjects[objKey] == nil
 			}, "5s", "100ms").Should(BeTrue())
+		})
+	})
+
+	Describe("Watch lifecycle", func() {
+		var (
+			key    types.NamespacedName
+			objKey string
+		)
+
+		BeforeEach(func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cm", Namespace: namespace},
+				Data:       map[string]string{"key": "value"},
+			}
+			Expect(k8sClient.Create(testCtx, cm)).To(Succeed())
+			key = types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}
+			gvk, _ := cachingClient.GroupVersionKindFor(cm)
+			objKey = gvk.String() + "|" + key.String()
+		})
+
+		entryWatcher := func() watch.Interface {
+			cachingClient.wmut.RLock()
+			defer cachingClient.wmut.RUnlock()
+			if ca := cachingClient.watchedObjects[objKey]; ca != nil {
+				return ca.watcher
+			}
+			return nil
+		}
+
+		It("should start exactly one watch for concurrent cache misses", func() {
+			var started atomic.Int32
+			orig := cachingClient.startWatch
+			cachingClient.startWatch = func(ctx context.Context, m *meta.RESTMapping, k client.ObjectKey) (watch.Interface, error) {
+				started.Add(1)
+				return orig(ctx, m, k)
+			}
+
+			var wg sync.WaitGroup
+			for range 20 {
+				wg.Add(1)
+				go func() {
+					defer GinkgoRecover()
+					defer wg.Done()
+					out := &corev1.ConfigMap{}
+					Expect(cachingClient.Get(testCtx, key, out)).To(Succeed())
+					Expect(out.Data["key"]).To(Equal("value"))
+				}()
+			}
+			wg.Wait()
+			Expect(started.Load()).To(Equal(int32(1)))
+		})
+
+		It("should stop the watch when the cache entry is cleared", func() {
+			Expect(cachingClient.Get(testCtx, key, &corev1.ConfigMap{})).To(Succeed())
+			w := entryWatcher()
+			Expect(w).NotTo(BeNil())
+
+			cachingClient.clearEntryByKey(objKey)
+
+			Eventually(func() bool {
+				select {
+				case _, open := <-w.ResultChan():
+					return !open
+				default:
+					return false
+				}
+			}, "5s", "50ms").Should(BeTrue())
+		})
+
+		It("should keep the newer entry when a replaced watch terminates", func() {
+			Expect(cachingClient.Get(testCtx, key, &corev1.ConfigMap{})).To(Succeed())
+			first := entryWatcher()
+			cachingClient.clearEntryByKey(objKey)
+
+			Expect(cachingClient.Get(testCtx, key, &corev1.ConfigMap{})).To(Succeed())
+			second := entryWatcher()
+			Expect(second).NotTo(BeNil())
+			Expect(second).NotTo(BeIdenticalTo(first))
+
+			// The first watch's goroutine exits after Stop; it must not drop the second's entry.
+			Consistently(entryWatcher, "1s", "100ms").Should(BeIdenticalTo(second))
 		})
 	})
 

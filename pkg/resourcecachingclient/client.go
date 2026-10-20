@@ -36,7 +36,12 @@ type Client struct {
 	watchedGVKs    map[string]bool           // read only once init
 	watchedObjects map[string]*watchedObject // mutex'ed
 	wmut           sync.RWMutex              // for watchedObjects map
-	ctx            context.Context           // context for long-running operations (ex. Watch requests)
+	// cmut serializes cache-miss handling so concurrent misses on one key start ONE watch.
+	// ponytail: one lock for all keys; a sidecar caches a handful of objects, so per-key locks buy nothing.
+	cmut sync.Mutex
+	// startWatch opens the per-object watch; a field so tests can count watches.
+	startWatch func(ctx context.Context, mapping *meta.RESTMapping, key client.ObjectKey) (watch.Interface, error)
+	ctx        context.Context // context for long-running operations (ex. Watch requests)
 }
 
 // CreateClient creates a new client layer that sits on top of the provided `underlying` client.
@@ -57,7 +62,7 @@ func CreateClient(ctx context.Context, mgr manager.Manager, cachedObjectTypes []
 		watchedGVKs[gvk.String()] = true
 	}
 
-	return &Client{
+	c := &Client{
 		Client:         mgr.GetClient(),
 		watchedGVKs:    watchedGVKs,
 		scheme:         mgr.GetScheme(),
@@ -65,12 +70,16 @@ func CreateClient(ctx context.Context, mgr manager.Manager, cachedObjectTypes []
 		mapper:         mgr.GetRESTMapper(),
 		watchedObjects: make(map[string]*watchedObject),
 		ctx:            ctx,
-	}, nil
+	}
+	c.startWatch = c.typedWatch
+	return c, nil
 }
 
 type watchedObject struct {
 	cached   client.Object
 	handlers []handlerOnQueue
+	// watcher is the single watch that feeds this entry; nil means no live watch, so Get is a miss.
+	watcher watch.Interface
 }
 
 type handlerOnQueue struct {
@@ -105,20 +114,15 @@ func (c *Client) getAndCreateWatchIfNeeded(
 	strGVK := gvk.String()
 	objKey := strGVK + "|" + key.String()
 
-	// Checking if object presented in cache
-	c.wmut.RLock()
-	ca := c.watchedObjects[objKey]
-	c.wmut.RUnlock()
-	if ca != nil {
-		if ca.cached == nil {
-			return objKey, errors.NewNotFound(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, key.Name)
-		}
-		// Return from cache
-		err := copyInto(ca.cached, obj)
-		if err != nil {
-			return objKey, err
-		}
-		return objKey, nil
+	if hit, err := c.getFromCache(objKey, gvk, key, obj); hit {
+		return objKey, err
+	}
+
+	c.cmut.Lock()
+	defer c.cmut.Unlock()
+	// Another goroutine may have started the watch while we waited for the lock.
+	if hit, err := c.getFromCache(objKey, gvk, key, obj); hit {
+		return objKey, err
 	}
 
 	// Live query
@@ -137,20 +141,43 @@ func (c *Client) getAndCreateWatchIfNeeded(
 	}
 
 	// Create watch for later calls
-	w, err := c.typedWatch(c.ctx, mapping, key)
+	w, err := c.startWatch(c.ctx, mapping, key)
 	if err != nil {
 		return objKey, err
 	}
 
-	// Store fetched object
-	err = c.setToCache(objKey, obj)
-	if err != nil {
-		return objKey, err
+	// Store fetched object together with the watch that owns the entry
+	c.wmut.Lock()
+	ca := c.watchedObjects[objKey]
+	if ca == nil {
+		ca = &watchedObject{}
+		c.watchedObjects[objKey] = ca
+	}
+	old := ca.watcher
+	ca.cached = obj.DeepCopyObject().(client.Object)
+	ca.watcher = w
+	c.wmut.Unlock()
+	if old != nil {
+		old.Stop()
 	}
 
 	// Start updating goroutine
 	go c.updateCache(c.ctx, objKey, w)
 	return objKey, nil
+}
+
+// getFromCache copies the cached object into obj. hit is false when the key has no live watch.
+func (c *Client) getFromCache(objKey string, gvk schema.GroupVersionKind, key client.ObjectKey, obj client.Object) (bool, error) {
+	c.wmut.RLock()
+	defer c.wmut.RUnlock()
+	ca := c.watchedObjects[objKey]
+	if ca == nil || ca.watcher == nil {
+		return false, nil
+	}
+	if ca.cached == nil {
+		return true, errors.NewNotFound(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, key.Name)
+	}
+	return true, copyInto(ca.cached, obj)
 }
 
 func (c *Client) restClientForMapping(mapping *meta.RESTMapping) (rest.Interface, error) {
@@ -226,21 +253,27 @@ func (c *Client) updateCache(ctx context.Context, key string, watcher watch.Inte
 		switch watchEvent.Type {
 		case watch.Modified:
 			prior = c.snapshotCached(key)
-			if err := c.setToCache(key, watchEvent.Object); err != nil {
+			if err := c.setToCache(key, watcher, watchEvent.Object); err != nil {
 				logger.WithValues("key", key).Error(err, "Error while updating cache")
 			}
 		case watch.Added:
-			if err := c.setToCache(key, watchEvent.Object); err != nil {
+			if err := c.setToCache(key, watcher, watchEvent.Object); err != nil {
 				logger.WithValues("key", key).Error(err, "Error while updating cache")
 			}
 		case watch.Deleted:
 			prior = c.snapshotCached(key)
-			c.removeFromCache(key)
+			c.removeFromCache(key, watcher)
 		}
 		c.callHandlers(ctx, key, watchEvent, prior)
 	}
 	logger.WithValues("key", key).Info("Watch terminated. Clearing cache entry.")
-	c.clearEntryByKey(key)
+	// Only the owning watch may drop the entry: a replaced or stopped watch must not
+	// clear the entry a newer watch now feeds (that is what used to leak watches).
+	c.wmut.Lock()
+	if ca := c.watchedObjects[key]; ca != nil && ca.watcher == watcher {
+		delete(c.watchedObjects, key)
+	}
+	c.wmut.Unlock()
 }
 
 // snapshotCached returns a deep copy of the cached object before a watch update, or nil if none.
@@ -254,25 +287,24 @@ func (c *Client) snapshotCached(key string) client.Object {
 	return ca.cached.DeepCopyObject().(client.Object)
 }
 
-func (c *Client) setToCache(key string, obj runtime.Object) error {
+// setToCache stores an event's object, but only while watcher still owns the entry.
+func (c *Client) setToCache(key string, watcher watch.Interface, obj runtime.Object) error {
 	cObj, ok := obj.(client.Object)
 	if !ok {
 		return fmt.Errorf("could not convert runtime.Object to client.Object")
 	}
 	c.wmut.Lock()
 	defer c.wmut.Unlock()
-	if ca := c.watchedObjects[key]; ca != nil {
+	if ca := c.watchedObjects[key]; ca != nil && ca.watcher == watcher {
 		ca.cached = cObj
-	} else {
-		c.watchedObjects[key] = &watchedObject{cached: cObj}
 	}
 	return nil
 }
 
-func (c *Client) removeFromCache(key string) {
+func (c *Client) removeFromCache(key string, watcher watch.Interface) {
 	c.wmut.Lock()
 	defer c.wmut.Unlock()
-	if ca := c.watchedObjects[key]; ca != nil {
+	if ca := c.watchedObjects[key]; ca != nil && ca.watcher == watcher {
 		ca.cached = nil
 	}
 }
@@ -372,12 +404,15 @@ func (c *Client) clearEntry(ctx context.Context, obj client.Object) {
 	}
 }
 
+// clearEntryByKey drops the entry and stops its watch; the next Get starts a fresh one.
 func (c *Client) clearEntryByKey(key string) {
-	// Note that this doesn't remove the watch, which lives in a goroutine
-	// Watch would recreate cache object on received event, or it can be recreated on subsequent Get call
 	c.wmut.Lock()
-	defer c.wmut.Unlock()
+	ca := c.watchedObjects[key]
 	delete(c.watchedObjects, key)
+	c.wmut.Unlock()
+	if ca != nil && ca.watcher != nil {
+		ca.watcher.Stop()
+	}
 }
 
 func (c *Client) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
