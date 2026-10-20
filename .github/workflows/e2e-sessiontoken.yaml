@@ -63,11 +63,11 @@ jobs:
 
       - name: Diagnostics
         if: failure()
-        run: hack/e2e/sessiontoken-e2e.sh diagnostics > e2e-diagnostics.txt 2>&1 || true
+        run: hack/e2e/sessiontoken-e2e.sh diagnostics > e2e-cluster-dump.log 2>&1 || true
 
       - name: Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-diagnostics
-          path: e2e-diagnostics.txt
+          name: e2e-cluster-dump
+          path: e2e-cluster-dump.log
