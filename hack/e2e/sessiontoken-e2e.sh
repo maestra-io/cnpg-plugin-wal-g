@@ -188,7 +188,6 @@ spec:
         env:
         - {name: MINIO_ROOT_USER, value: $MINIO_ROOT_USER}
         - {name: MINIO_ROOT_PASSWORD, value: $MINIO_ROOT_PASSWORD}
-        - {name: MINIO_DEFAULT_BUCKETS, value: $BUCKET}
         ports: [{containerPort: 9000}]
         readinessProbe: {httpGet: {path: /minio/health/ready, port: 9000}, periodSeconds: 3}
         volumeMounts: [{name: data, mountPath: /bitnami/minio/data}]
@@ -208,10 +207,19 @@ kubectl -n minio rollout status deploy/minio --timeout=300s
 
 # Non-root MinIO user that may AssumeRole (root credentials cannot).
 mc_in() { kubectl -n minio exec deploy/minio -- mc --config-dir /tmp/mc "$@"; }  # HOME=/ is read-only for uid 1001
-mc_in alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
-mc_in mb --ignore-existing "local/$BUCKET"
-mc_in admin user add local "$WALG_USER" "$WALG_PASSWORD"
-mc_in admin policy attach local readwrite --user "$WALG_USER"
+# Retried as a whole: Ready on the Deployment does not mean the server stays up
+# (the Bitnami entrypoint can run a temporary MinIO for its init and restart it,
+# which refused `mc alias set` right after rollout status in one CI run). Every
+# step is idempotent; policy attach errors when the policy is already attached,
+# so that case is accepted via `user info`.
+minio_setup() {
+    mc_in alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
+    mc_in mb --ignore-existing "local/$BUCKET" &&
+    mc_in admin user add local "$WALG_USER" "$WALG_PASSWORD" &&
+    { mc_in admin policy attach local readwrite --user "$WALG_USER" ||
+      mc_in admin user info local "$WALG_USER" | grep -qw readwrite; }
+}
+wait_for "MinIO bucket + AssumeRole user" 120 minio_setup
 
 kubectl -n minio port-forward svc/minio "$PF_PORT:9000" >/tmp/minio-pf.log 2>&1 &
 PF_PID=$!
