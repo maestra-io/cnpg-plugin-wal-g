@@ -37,7 +37,7 @@ type Client struct {
 	watchedObjects map[string]*watchedObject // mutex'ed
 	wmut           sync.RWMutex              // for watchedObjects map
 	// cmut (capacity 1) serializes cache-miss handling so concurrent misses on one key start ONE
-	// watch; a channel, not a Mutex, so a waiting caller still honours its ctx.
+	// watch; a channel, not a Mutex, so a waiting caller still honors its ctx.
 	// ponytail: one lock for all keys; a sidecar caches a handful of objects, so per-key locks buy nothing.
 	cmut chan struct{}
 	// startWatch opens the per-object watch; a field so tests can count watches.
