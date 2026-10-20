@@ -1,0 +1,73 @@
+name: e2e (kind + CNPG + MinIO STS)
+
+# End-to-end test of the plugin image against S3 with temporary (STS)
+# credentials, the R2 shape (key + secret + session token): WAL archiving,
+# backup-push, backup-list, wal-verify, credential rotation, restore into a new
+# Cluster, and a negative control without sessionToken.
+# See hack/e2e/sessiontoken-e2e.sh.
+#
+# Runs on PRs that change what goes into the image. workflow_dispatch works
+# once this file is on the default branch (GitHub reads dispatchable
+# workflows from there); `gh workflow run ... --ref <branch>` then runs the
+# branch's copy.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, 'maestra/**' ]
+    paths:
+      - Dockerfile
+      - go.mod
+      - go.sum
+      - 'api/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'chart/**'
+      - 'hack/e2e/**'
+      - '.github/workflows/e2e-sessiontoken.yaml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-sessiontoken-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.33.0
+  IMAGE: docker.io/local/cnpg-plugin-wal-g:e2e
+
+jobs:
+  e2e:
+    name: kind + CNPG 1.30 + MinIO STS
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 kind /usr/local/bin/kind
+          kind version; kubectl version --client; helm version; aws --version; jq --version
+
+      - name: Build plugin image (runtime target, as release.yaml)
+        run: |
+          docker build --target=runtime \
+            --build-arg GIT_TAG=v0.0.0-e2e --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
+            -t "${IMAGE}" .
+
+      - name: Run e2e
+        run: hack/e2e/sessiontoken-e2e.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: hack/e2e/sessiontoken-e2e.sh diagnostics > e2e-cluster-dump.log 2>&1 || true
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cluster-dump
+          path: e2e-cluster-dump.log

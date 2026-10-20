@@ -42,3 +42,11 @@ const PluginModeNormal = "normal"
 const PluginModeRecovery = "recovery"
 
 var AllowedPluginModes = []string{PluginModeNormal, PluginModeRecovery}
+
+// InstancePluginSocketPath is the unix socket the instance plugin (sidecar)
+// serves CNPG-I on: cnpg-i-machinery's default plugin directory /plugins
+// joined with PluginMetadata.Name. The instance manager connects to it.
+const InstancePluginSocketPath = "/plugins/" + PluginNameDeprecated
+
+// PluginBinaryPath is where the image installs the plugin binary (Dockerfile).
+const PluginBinaryPath = "/usr/local/bin/cnpg-plugin-wal-g"

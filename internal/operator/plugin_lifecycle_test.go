@@ -17,8 +17,13 @@ limitations under the License.
 package operator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	decoder "github.com/cloudnative-pg/cnpg-i-machinery/pkg/pluginhelper/decoder"
@@ -662,6 +667,90 @@ var _ = Describe("LifecycleImplementation", func() {
 				Name:  "ADDITIONAL_ENV",
 				Value: "additional-value",
 			}))
+		})
+	})
+
+	Describe("plugin-wal-g startupProbe", func() {
+		newPodSpec := func() *corev1.PodSpec {
+			return &corev1.PodSpec{Containers: []corev1.Container{{Name: "postgres"}}}
+		}
+
+		It("gates the main containers on the CNPG-I socket of a native sidecar", func() {
+			podSpec := newPodSpec()
+			Expect(reconcilePodSpecWithPluginSidecar(testCluster, testBackupConfig, podSpec, "postgres", nil)).To(Succeed())
+
+			Expect(podSpec.InitContainers).To(HaveLen(1))
+			sidecar := podSpec.InitContainers[0]
+			Expect(sidecar.RestartPolicy).To(Equal(ptr.To(corev1.ContainerRestartPolicyAlways)))
+			Expect(sidecar.StartupProbe).NotTo(BeNil())
+			Expect(sidecar.StartupProbe.Exec).NotTo(BeNil())
+			Expect(sidecar.StartupProbe.Exec.Command).To(Equal(
+				[]string{"/bin/sh", "-c", sidecarStartupProbeScript, "/usr/local/bin/cnpg-plugin-wal-g"}))
+			Expect(sidecar.StartupProbe.PeriodSeconds).To(BeEquivalentTo(2))
+			Expect(sidecar.StartupProbe.TimeoutSeconds).To(BeEquivalentTo(5))
+			Expect(sidecar.StartupProbe.FailureThreshold).To(BeEquivalentTo(90))
+			// No liveness/readiness probe: a hung plugin must not restart postgres' pod.
+			Expect(sidecar.LivenessProbe).To(BeNil())
+			Expect(sidecar.ReadinessProbe).To(BeNil())
+
+			// The probe runs inside the sidecar: /plugins (where the socket lives) must be mounted there.
+			Expect(sidecar.VolumeMounts).To(ContainElement(HaveField("MountPath", "/plugins")))
+		})
+
+		// The probe's command, run against fake plugin binaries: the image may be
+		// older than the operator (--cnpg-i-pg-sidecar-image) and lack healthcheck.
+		DescribeTable("probe command against the sidecar image's binary",
+			func(fakeBinary string, wantExit int, wantStderr string) {
+				dir := GinkgoT().TempDir()
+				bin := filepath.Join(dir, "cnpg-plugin-wal-g")
+				Expect(os.WriteFile(bin, []byte("#!/bin/sh\n"+fakeBinary+"\n"), 0o755)).To(Succeed())
+
+				command := sidecarStartupProbe().Exec.Command
+				command[len(command)-1] = bin
+				var stderr bytes.Buffer
+				probe := exec.Command(command[0], command[1:]...)
+				probe.Stderr = &stderr
+				err := probe.Run()
+				if wantExit == 0 {
+					Expect(err).NotTo(HaveOccurred(), stderr.String())
+				} else {
+					var exitErr *exec.ExitError
+					Expect(errors.As(err, &exitErr)).To(BeTrue(), "probe should exit non-zero, got %v", err)
+					Expect(exitErr.ExitCode()).To(Equal(wantExit))
+				}
+				Expect(stderr.String()).To(ContainSubstring(wantStderr))
+			},
+			Entry("healthcheck passes", `[ "$1" = healthcheck ] && exit 0; exit 3`, 0, ""),
+			Entry("healthcheck fails: the probe fails and prints why",
+				`echo "instance plugin on /plugins/x does not answer: connection refused" >&2; exit 1`,
+				1, "does not answer: connection refused"),
+			Entry("image predates healthcheck (cobra unknown command): the probe passes, no gating",
+				`echo 'Error: unknown command "healthcheck" for "cnpg-plugin-wal-g"' >&2
+echo "Run 'cnpg-plugin-wal-g --help' for usage." >&2
+echo 'unknown command "healthcheck" for "cnpg-plugin-wal-g"'; exit 1`, 0, ""),
+			Entry("some other unknown command is still a failure",
+				`echo 'Error: unknown command "instance" for "cnpg-plugin-wal-g"' >&2; exit 1`,
+				1, `unknown command "instance"`),
+		)
+
+		It("is set on the recovery job's sidecar too", func() {
+			podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "full-recovery"}}}
+			Expect(reconcilePodSpecWithPluginSidecar(testCluster, testBackupConfig, podSpec, "full-recovery", nil)).
+				To(Succeed())
+			Expect(podSpec.InitContainers).To(HaveLen(1))
+			Expect(podSpec.InitContainers[0].StartupProbe).NotTo(BeNil())
+		})
+
+		It("is not set on a plain init container (sidecarRestartPolicy: unset)", func() {
+			cluster := testCluster.DeepCopy()
+			cluster.Spec.Plugins[0].Parameters["sidecarRestartPolicy"] = "unset"
+
+			podSpec := newPodSpec()
+			Expect(reconcilePodSpecWithPluginSidecar(cluster, testBackupConfig, podSpec, "postgres", nil)).To(Succeed())
+
+			Expect(podSpec.InitContainers).To(HaveLen(1))
+			Expect(podSpec.InitContainers[0].RestartPolicy).To(BeNil())
+			Expect(podSpec.InitContainers[0].StartupProbe).To(BeNil())
 		})
 	})
 
