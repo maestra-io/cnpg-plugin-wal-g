@@ -2,8 +2,10 @@
 
 # WAL-G Build section
 # Need to build from sources, because binary distributions do not include necessary base OS libs
-# Go 1.27: wal-g master's go.mod requires go >= 1.27.2 (the image sets GOTOOLCHAIN=local).
-FROM docker.io/golang:1.27-trixie AS walg-builder
+# Go 1.27: wal-g master's go.mod requires go >= 1.27.2 and the image sets
+# GOTOOLCHAIN=local, so pin a patch tag: a stale cached golang:1.27-trixie
+# (1.27.0/1.27.1) would fail `make deps`.
+FROM docker.io/golang:1.27.3-trixie AS walg-builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG WALG_REPO=https://github.com/wal-g/wal-g
@@ -47,7 +49,8 @@ RUN cd $(go env GOPATH)/src/github.com/wal-g/wal-g && \
 
 # Controller Build section
 #
-FROM docker.io/golang:1.26-trixie AS controller-builder
+# go.mod requires go >= 1.26.4 (cloudnative-pg 1.28.4); pinned for the same reason.
+FROM docker.io/golang:1.26.10-trixie AS controller-builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG GIT_TAG=v0.0.0-dev
