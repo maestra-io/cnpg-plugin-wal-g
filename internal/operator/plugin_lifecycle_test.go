@@ -665,6 +665,54 @@ var _ = Describe("LifecycleImplementation", func() {
 		})
 	})
 
+	Describe("plugin-wal-g startupProbe", func() {
+		newPodSpec := func() *corev1.PodSpec {
+			return &corev1.PodSpec{Containers: []corev1.Container{{Name: "postgres"}}}
+		}
+
+		It("gates the main containers on the CNPG-I socket of a native sidecar", func() {
+			podSpec := newPodSpec()
+			Expect(reconcilePodSpecWithPluginSidecar(testCluster, testBackupConfig, podSpec, "postgres", nil)).To(Succeed())
+
+			Expect(podSpec.InitContainers).To(HaveLen(1))
+			sidecar := podSpec.InitContainers[0]
+			Expect(sidecar.RestartPolicy).To(Equal(ptr.To(corev1.ContainerRestartPolicyAlways)))
+			Expect(sidecar.StartupProbe).NotTo(BeNil())
+			Expect(sidecar.StartupProbe.Exec).NotTo(BeNil())
+			Expect(sidecar.StartupProbe.Exec.Command).To(Equal(
+				[]string{"/usr/local/bin/cnpg-plugin-wal-g", "healthcheck"}))
+			Expect(sidecar.StartupProbe.PeriodSeconds).To(BeEquivalentTo(2))
+			Expect(sidecar.StartupProbe.TimeoutSeconds).To(BeEquivalentTo(5))
+			Expect(sidecar.StartupProbe.FailureThreshold).To(BeEquivalentTo(90))
+			// No liveness/readiness probe: a hung plugin must not restart postgres' pod.
+			Expect(sidecar.LivenessProbe).To(BeNil())
+			Expect(sidecar.ReadinessProbe).To(BeNil())
+
+			// The probe runs inside the sidecar: /plugins (where the socket lives) must be mounted there.
+			Expect(sidecar.VolumeMounts).To(ContainElement(HaveField("MountPath", "/plugins")))
+		})
+
+		It("is set on the recovery job's sidecar too", func() {
+			podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "full-recovery"}}}
+			Expect(reconcilePodSpecWithPluginSidecar(testCluster, testBackupConfig, podSpec, "full-recovery", nil)).
+				To(Succeed())
+			Expect(podSpec.InitContainers).To(HaveLen(1))
+			Expect(podSpec.InitContainers[0].StartupProbe).NotTo(BeNil())
+		})
+
+		It("is not set on a plain init container (sidecarRestartPolicy: unset)", func() {
+			cluster := testCluster.DeepCopy()
+			cluster.Spec.Plugins[0].Parameters["sidecarRestartPolicy"] = "unset"
+
+			podSpec := newPodSpec()
+			Expect(reconcilePodSpecWithPluginSidecar(cluster, testBackupConfig, podSpec, "postgres", nil)).To(Succeed())
+
+			Expect(podSpec.InitContainers).To(HaveLen(1))
+			Expect(podSpec.InitContainers[0].RestartPolicy).To(BeNil())
+			Expect(podSpec.InitContainers[0].StartupProbe).To(BeNil())
+		})
+	})
+
 	Describe("injectPluginSidecarPodSpec", func() {
 		It("should add sidecar container to pod spec", func() {
 			podSpec := &corev1.PodSpec{

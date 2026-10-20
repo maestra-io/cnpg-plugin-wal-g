@@ -53,6 +53,7 @@ func main() {
 		cmd.NewOperatorCmd(),
 		cmd.NewDumpConfigCmd(),
 		cmd.NewVersionCmd(),
+		cmd.NewHealthcheckCmd(),
 	)
 
 	if err := rootCmd.ExecuteContext(ctrl.SetupSignalHandler()); err != nil {

@@ -259,17 +259,6 @@ func reconcilePodSpecWithPluginSidecar(
 
 	envs = append(envs, additionalEnvs...)
 
-	// TODO: @endevir implement me
-	// baseProbe := &corev1.Probe{
-	// 	FailureThreshold: 10,
-	// 	TimeoutSeconds:   10,
-	// 	ProbeHandler: corev1.ProbeHandler{
-	// 		Exec: &corev1.ExecAction{
-	// 			Command: []string{"/manager", "healthcheck", "unix"},
-	// 		},
-	// 	},
-	// }
-
 	sidecarConfig := corev1.Container{}
 	sidecarConfig.Name = "plugin-wal-g"
 	sidecarConfig.Image = viper.GetString("cnpg-i-pg-sidecar-image")
@@ -282,8 +271,6 @@ func reconcilePodSpecWithPluginSidecar(
 
 	sidecarConfig.Resources = backupConfig.Spec.Resources
 
-	// TODO: @endevir implement me
-	// sidecarConfig.StartupProbe = baseProbe.DeepCopy()
 	sidecarConfig.SecurityContext = &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		RunAsNonRoot:             ptr.To(true),
@@ -332,12 +319,40 @@ func reconcilePodSpecWithPluginSidecar(
 	}
 
 	restartPolicy := common.GetInitContainerRestartPolicy(cluster)
+	// Only a native sidecar (restartPolicy Always) may carry a startupProbe;
+	// a plain init container is rejected by the API server if it has one.
+	if restartPolicy != nil && *restartPolicy == corev1.ContainerRestartPolicyAlways {
+		sidecarConfig.StartupProbe = sidecarStartupProbe()
+	}
 
 	if err := injectPluginSidecarPodSpec(spec, &sidecarConfig, jobRole, restartPolicy); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// sidecarStartupProbe gates the Pod's main containers on the instance plugin's
+// CNPG-I socket. The kubelet starts the main containers only after a native
+// sidecar's startupProbe has succeeded, and the instance manager loads the
+// plugins it finds on /plugins once, at start-up: if postgres starts before
+// the socket answers, the instance manager runs without the plugin for its
+// whole life ("Unknown plugin"). Seen after node reboots on 2026-10-19/20.
+//
+// It probes every 2s (the main containers wait at most ~2s past the socket),
+// and after 3 minutes without an answer the kubelet restarts the sidecar.
+func sidecarStartupProbe() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{common.PluginBinaryPath, "healthcheck"},
+			},
+		},
+		PeriodSeconds:    2,
+		TimeoutSeconds:   5,
+		SuccessThreshold: 1,
+		FailureThreshold: 90,
+	}
 }
 
 // injectPluginSidecarPodSpec injects a plugin sidecar into a CNPG Pod spec.
