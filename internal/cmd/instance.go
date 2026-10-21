@@ -54,5 +54,20 @@ func NewInstanceSubcommand() *cobra.Command {
 		"CNPG-I GRPC server socket path (default /plugins/cnpg-extensions.yandex.cloud)")
 	_ = viper.BindPFlag("cnpg-i-socket-path", cmd.Flags().Lookup("cnpg-i-socket-path"))
 
+	// Switchover WAL guard, target primary side (internal/instance/switchover_guard.go).
+	// Each flag can also be set through the environment variable named after it,
+	// e.g. via the Cluster's spec.env, which the sidecar inherits.
+	cmd.Flags().Duration(instance.SwitchoverTargetRetryTimeoutKey, instance.DefaultSwitchoverTargetRetryTimeout,
+		"during a switchover, how long in total (from the first miss) the target primary keeps polling the archive "+
+			"for missing WAL segments of the current timeline before answering 'not found' (0 disables the retry) "+
+			"[env SWITCHOVER_TARGET_RETRY_TIMEOUT]")
+	_ = viper.BindPFlag(instance.SwitchoverTargetRetryTimeoutKey, cmd.Flags().Lookup(instance.SwitchoverTargetRetryTimeoutKey))
+	_ = viper.BindEnv(instance.SwitchoverTargetRetryTimeoutKey, "SWITCHOVER_TARGET_RETRY_TIMEOUT")
+
+	cmd.Flags().Duration(instance.SwitchoverTargetRetryIntervalKey, instance.DefaultSwitchoverTargetRetryInterval,
+		"pause between two archive polls of the switchover target primary [env SWITCHOVER_TARGET_RETRY_INTERVAL]")
+	_ = viper.BindPFlag(instance.SwitchoverTargetRetryIntervalKey, cmd.Flags().Lookup(instance.SwitchoverTargetRetryIntervalKey))
+	_ = viper.BindEnv(instance.SwitchoverTargetRetryIntervalKey, "SWITCHOVER_TARGET_RETRY_INTERVAL")
+
 	return cmd
 }

@@ -44,6 +44,12 @@ type WALTimelineInfo struct {
 	Status           string           `json:"status"`
 }
 
+// Timeline statuses of `wal-g wal-show`.
+const (
+	TimelineStatusOK           = "OK"
+	TimelineStatusLostSegments = "LOST_SEGMENTS"
+)
+
 // HasMissingSegments returns true if there are any missing WAL segments in this timeline
 func (w *WALTimelineInfo) HasMissingSegments() bool {
 	return len(w.MissingSegments) > 0
@@ -51,7 +57,7 @@ func (w *WALTimelineInfo) HasMissingSegments() bool {
 
 // IsOK returns true if the timeline status is "OK"
 func (w *WALTimelineInfo) IsOK() bool {
-	return w.Status == "OK"
+	return w.Status == TimelineStatusOK
 }
 
 // StorageCheckReadable verifies that the configured storage is accessible for reading

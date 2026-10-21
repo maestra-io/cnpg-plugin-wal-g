@@ -31,6 +31,35 @@ This plugin adds backup and restore functionality to [CloudNativePG](https://clo
 - [x] Monitoring
 - [x] `BackupConfig` Status displaying for last recoverability point, last successful backup, storage consumption
 
+## Switchover WAL guard
+
+During a switchover (`status.targetPrimary` differs from `status.currentPrimary`) the
+plugin changes how it serves WAL segments of the cluster's current timeline
+(`status.timelineID`, still the old primary's), to close the race of
+[cloudnative-pg#11715](https://github.com/cloudnative-pg/cloudnative-pg/issues/11715),
+where a replica restored the old primary's final segment from the archive and diverged
+past the new timeline's fork:
+
+- a replica that is not the target gets "not found" without an archive lookup, so it
+  waits and streams from the new primary;
+- the target primary polls the archive on "not found" (1 s apart, at most 5 s per
+  switchover counted from its first miss), so it replays the old primary's final segment
+  before it promotes. PostgreSQL cannot act on the promote request while the restore runs,
+  so a promotion waits up to that long when the segment never comes (the common case of
+  a switchover whose standbys streamed everything).
+
+Timeline history, `.partial` and `.backup` files, replica clusters and full-recovery jobs
+are not affected. Knobs:
+
+| Where | Name | Default | Effect |
+|---|---|---|---|
+| Cluster `spec.plugins[].parameters` | `switchoverReplicaWALGuard` | `true` | `false` serves non-target replicas as before |
+| Cluster `spec.plugins[].parameters` | `switchoverTargetWALRetry` | `true` | `false` answers the target primary at once, as before |
+| sidecar env (e.g. Cluster `spec.env`) | `SWITCHOVER_TARGET_RETRY_TIMEOUT` | `5s` | polling budget per switchover; `0` disables it |
+| sidecar env | `SWITCHOVER_TARGET_RETRY_INTERVAL` | `1s` | pause between polls |
+
+Durations take Go syntax (`15s`, `500ms`); a bare number means seconds.
+
 ## Dependencies
 
 - [Kubernetes](https://kubernetes.io/releases/) version 1.28 or higher

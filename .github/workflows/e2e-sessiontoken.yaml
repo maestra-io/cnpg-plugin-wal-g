@@ -4,7 +4,7 @@ name: e2e (kind + CNPG + MinIO STS)
 # credentials, the R2 shape (key + secret + session token): WAL archiving,
 # backup-push, backup-list, wal-verify, credential rotation, restore into a new
 # Cluster, and a negative control without sessionToken.
-# See hack/e2e/sessiontoken-e2e.sh.
+# See hack/e2e/sessiontoken-e2e.sh. A second job runs hack/e2e/switchover-e2e.sh.
 #
 # Runs on PRs that change what goes into the image. workflow_dispatch works
 # once this file is on the default branch (GitHub reads dispatchable
@@ -71,3 +71,45 @@ jobs:
         with:
           name: e2e-cluster-dump
           path: e2e-cluster-dump.log
+
+  # The switchover WAL guard (internal/instance/switchover_guard.go) against the
+  # race of cloudnative-pg/cloudnative-pg#11715: a 3-instance cluster, a CDC client
+  # that stalls the old primary's shutdown, two switchovers.
+  # See hack/e2e/switchover-e2e.sh.
+  switchover:
+    name: kind + CNPG 1.30 switchover with a stalled CDC client
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 kind /usr/local/bin/kind
+          kind version; kubectl version --client; helm version; jq --version
+
+      - name: Build plugin image (runtime target, as release.yaml)
+        run: |
+          docker build --target=runtime \
+            --build-arg GIT_TAG=v0.0.0-e2e --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
+            -t "${IMAGE}" .
+
+      - name: Run switchover e2e
+        env:
+          E2E_OUT: ${{ runner.temp }}/switchover-e2e
+        run: hack/e2e/switchover-e2e.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: hack/e2e/switchover-e2e.sh diagnostics > switchover-cluster-dump.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: switchover-e2e-logs
+          path: |
+            ${{ runner.temp }}/switchover-e2e
+            switchover-cluster-dump.log
+          if-no-files-found: ignore
