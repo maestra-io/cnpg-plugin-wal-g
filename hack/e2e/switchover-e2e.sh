@@ -15,8 +15,9 @@
 #   - no instance logs "forked off current database system timeline" or
 #     "is not in this server's history";
 #   - both replicas stream from the new primary, on the new timeline;
-#   - when the old primary's shutdown stalled and both physical walsenders were
-#     reaped (the precondition of the incident): the new timeline forks at a
+#   - when the old primary's shutdown stalled and both standbys had lost their
+#     stream before its shutdown checkpoint (the precondition of the incident;
+#     the test cuts the streams itself, see STREAM_CUT_AFTER): the new timeline forks at a
 #     WAL segment boundary, i.e. the target replayed the old primary's final
 #     XLOG_SWITCH from the archive before promoting, and the non-target
 #     replica's sidecar withheld old-timeline segments meanwhile.
@@ -40,6 +41,8 @@ MINIO_ROOT_PASSWORD=minioadmin-e2e-pass
 WALG_USER=walguser
 WALG_PASSWORD=walguser-e2e-pass
 CDC_PASSWORD=cdc-e2e-pass
+# Seconds after the switchover starts at which the standbys' streams are cut.
+STREAM_CUT_AFTER=${STREAM_CUT_AFTER:-6}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${E2E_OUT:-/tmp/switchover-e2e}
 mkdir -p "$OUT"
@@ -281,6 +284,22 @@ switchover() { # switchover <old primary> <target> <third replica>
     kubectl -n "$NS" patch clusters.postgresql.cnpg.io pg --subresource=status --type=merge -p \
         "{\"status\":{\"targetPrimary\":\"$target\",\"targetPrimaryTimestamp\":\"$t0\",\"phase\":\"Switchover in progress\",\"phaseReason\":\"Switching over to $target\"}}"
 
+    # Cut both standbys' streams while the old primary's shutdown is stalled, as
+    # wal_sender_timeout did in production (~1.5 x wal_sender_timeout after the
+    # shutdown request; on kind the physical walsenders survive the stall). The old
+    # primary refuses new connections while it shuts down, so neither standby gets
+    # the shutdown XLOG_SWITCH by streaming.
+    sleep "$STREAM_CUT_AFTER"
+    local cut_at cut=0 pod
+    cut_at=$(date -u '+%Y-%m-%d %H:%M:%S.%3N UTC')
+    for pod in "$target" "$third"; do
+        if kubectl -n "$NS" exec "$pod" -c postgres -- sh -c \
+            'pid=$(psql -U postgres -qtAX -c "select pid from pg_stat_wal_receiver"); [ -n "$pid" ] && kill -TERM "$pid"'; then
+            cut=$((cut + 1))
+        fi
+    done
+    log "cut the WAL streams of $cut standbys at $cut_at"
+
     wait_for "$target is the current primary" 300 bash -c "[[ \$(kubectl -n $NS get clusters.postgresql.cnpg.io pg -o jsonpath='{.status.currentPrimary}') == $target ]]"
     local new_tl
     new_tl=$(psql_in "$target" "select timeline_id from pg_control_checkpoint()")
@@ -296,7 +315,7 @@ switchover() { # switchover <old primary> <target> <third replica>
     # A diverged replica keeps retrying; give it time to say so.
     sleep 20
 
-    local pod diverged=""
+    local diverged=""
     for pod in pg-1 pg-2 pg-3; do
         pg_logs "$pod" "$since" > "$OUT/$pod-tl$new_tl.log"
         sidecar_logs "$pod" "$since" > "$OUT/$pod-tl$new_tl-sidecar.log"
@@ -325,17 +344,19 @@ switchover() { # switchover <old primary> <target> <third replica>
     offset=$(psql_in "$target" "select ('$switchpoint'::pg_lsn - '0/0'::pg_lsn)::numeric % (select setting::numeric from pg_settings where name = 'wal_segment_size')")
     log "timeline $new_tl forked at $switchpoint (offset $offset in its segment)"
 
-    if (( reaped_cdc > 0 && reaped_phys == 2 )); then
+    # The precondition: the shutdown stalled on the cdc walsender, and both streams
+    # were gone before the shutdown checkpoint (so before the XLOG_SWITCH).
+    if (( reaped_cdc > 0 && cut == 2 )) && [ -n "$shut_ckpt" ] && [[ "$cut_at" < "$shut_ckpt" ]]; then
         [ "$offset" = 0 ] || fail "stalled shutdown, streams reaped, and the fork $switchpoint is mid-segment: the target promoted without the old primary's final segment"
         grep -q "Switchover target primary: " "$OUT/$target-tl$new_tl-sidecar.log" ||
             grep -q '"switchoverGuard":"retry-on-miss"' "$OUT/$target-tl$new_tl-sidecar.log" ||
             fail "stall reproduced but the target's sidecar never took the switchover retry path"
         grep -q "Switchover in progress: not serving" "$OUT/$third-tl$new_tl-sidecar.log" ||
             note "$third never asked the archive for an old-timeline segment during the switchover"
-        pass "stalled shutdown reproduced ($reaped_phys physical + $reaped_cdc cdc walsenders reaped): the target replayed the old primary's final segment, fork at segment boundary $switchpoint"
+        pass "stalled shutdown reproduced (cdc walsender reaped, streams cut at $cut_at, shutdown checkpoint at $shut_ckpt): the target replayed the old primary's final segment, fork at segment boundary $switchpoint"
         STALLS=$((STALLS + 1))
     else
-        note "switchover to $target: shutdown did not reproduce the incident's precondition (physical reaped=$reaped_phys, cdc reaped=$reaped_cdc); divergence checks above still apply"
+        note "switchover to $target: shutdown did not reproduce the incident's precondition (cdc reaped=$reaped_cdc, streams cut=$cut at $cut_at, shutdown checkpoint '$shut_ckpt'); divergence checks above still apply"
     fi
     grep -h -E 'Switchover (in progress|target primary)' "$OUT/"*"-tl$new_tl-sidecar.log" | jq -Rr 'fromjson? | "\(.ts // "") \(.msg)"' | head -20 || true
 

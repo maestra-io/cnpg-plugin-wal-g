@@ -18,8 +18,6 @@ package instance
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
@@ -156,35 +154,29 @@ var _ = Describe("Switchover WAL guard", func() {
 
 	Describe("fetchWithTargetRetry", func() {
 		var (
-			clock    time.Time
-			promoted *time.Time // promote.signal appears at this time
-			env      retryEnv
-			cfg      targetRetryConfig
-			starts   []time.Duration // attempt start times, relative to t0
-			t0       time.Time
+			clock time.Time
+			env   retryEnv
+			cfg   targetRetryConfig
+			t0    time.Time
 		)
 
 		BeforeEach(func() {
 			t0 = time.Date(2026, 10, 21, 0, 13, 58, 0, time.UTC)
 			clock = t0
-			promoted = nil
-			starts = nil
-			cfg = targetRetryConfig{Timeout: 10 * time.Second, Interval: time.Second, PromoteGrace: 3 * time.Second}
+			cfg = targetRetryConfig{Timeout: 10 * time.Second, Interval: time.Second}
 			env = retryEnv{
 				now: func() time.Time { return clock },
 				sleep: func(_ context.Context, d time.Duration) error {
 					clock = clock.Add(d)
 					return nil
 				},
-				promoteRequested: func() bool { return promoted != nil && !clock.Before(*promoted) },
 			}
 		})
 
-		// fetchAppearingAt simulates a segment that lands in the archive at t0+landAt;
-		// each fetch takes fetchTime.
+		// fetchAppearingAt simulates a segment that lands in the archive at t0+landAt
+		// (never if landAt < 0); each fetch takes fetchTime.
 		fetchAppearingAt := func(landAt, fetchTime time.Duration) func(context.Context) fetchOutcome {
 			return func(context.Context) fetchOutcome {
-				starts = append(starts, clock.Sub(t0))
 				begin := clock
 				clock = clock.Add(fetchTime)
 				// A fetch only sees an object that existed when it started.
@@ -194,88 +186,83 @@ var _ = Describe("Switchover WAL guard", func() {
 				return fetchNotFound
 			}
 		}
+		retry := func(budget time.Duration, fetch func(context.Context) fetchOutcome) retryResult {
+			return fetchWithTargetRetry(context.Background(), cfg, env, budget, fetch)
+		}
 
 		It("returns at once when the segment is there", func() {
-			outcome, attempts, stop := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(0, 200*time.Millisecond))
-			Expect(outcome).To(Equal(fetchFound))
-			Expect(attempts).To(Equal(1))
-			Expect(stop).To(Equal(stopNone))
+			res := retry(cfg.Timeout, fetchAppearingAt(0, 200*time.Millisecond))
+			Expect(res.Outcome).To(Equal(fetchFound))
+			Expect(res.Attempts).To(Equal(1))
+			Expect(res.Stop).To(Equal(stopNone))
+			Expect(res.Waited).To(BeZero())
 		})
 
 		It("waits for the old primary's final segment (the race of the incident)", func() {
-			// email-scoring: the target's miss was decided 150 ms before the upload.
-			outcome, attempts, _ := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(1500*time.Millisecond, 200*time.Millisecond))
-			// Polls at 0, 1.2 and 2.4 s (1 s pause after each 200 ms fetch): the third one finds it.
-			Expect(outcome).To(Equal(fetchFound))
-			Expect(attempts).To(Equal(3))
-			Expect(clock.Sub(t0)).To(BeNumerically("<", 3*time.Second))
+			// The incident: the old primary's final segment landed ~3.6 s after the
+			// target's stream ended. Polls start at 0, 1.2, 2.4 and 3.6 s (a 1 s pause
+			// after each 200 ms fetch); the fourth one finds it.
+			res := retry(cfg.Timeout, fetchAppearingAt(3600*time.Millisecond, 200*time.Millisecond))
+			Expect(res.Outcome).To(Equal(fetchFound))
+			Expect(res.Attempts).To(Equal(4))
+			Expect(res.Waited).To(BeNumerically("<", 4*time.Second))
 		})
 
-		It("gives up after the retry timeout when the segment never comes", func() {
-			outcome, attempts, stop := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(-1, 200*time.Millisecond))
-			Expect(outcome).To(Equal(fetchNotFound))
-			Expect(stop).To(Equal(stopDeadline))
-			Expect(attempts).To(BeNumerically(">=", 9))
-			Expect(clock.Sub(t0)).To(BeNumerically(">=", 10*time.Second))
-			Expect(clock.Sub(t0)).To(BeNumerically("<", 10*time.Second+time.Second))
+		It("gives up when the budget is used up and the segment never comes", func() {
+			res := retry(cfg.Timeout, fetchAppearingAt(-1, 200*time.Millisecond))
+			Expect(res.Outcome).To(Equal(fetchNotFound))
+			Expect(res.Stop).To(Equal(stopDeadline))
+			Expect(res.Attempts).To(BeNumerically(">=", 9))
+			Expect(res.Waited).To(BeNumerically(">=", 10*time.Second))
+			Expect(res.Waited).To(BeNumerically("<", 11*time.Second))
 		})
 
-		It("stops early once a promote request is pending and a fetch after the grace missed", func() {
-			p := t0.Add(1 * time.Second)
-			promoted = &p
-			outcome, _, stop := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(-1, 200*time.Millisecond))
-			Expect(outcome).To(Equal(fetchNotFound))
-			Expect(stop).To(Equal(stopPromote))
-			// The promote request is seen within one watch step, and the deciding fetch
-			// started PromoteGrace after that.
-			last := starts[len(starts)-1]
-			Expect(last).To(BeNumerically(">=", 1*time.Second+cfg.PromoteGrace))
-			Expect(last).To(BeNumerically("<=", 1*time.Second+promoteWatchStep+cfg.PromoteGrace))
-			Expect(clock.Sub(t0)).To(BeNumerically("<", 4500*time.Millisecond))
+		It("uses only the budget left over from earlier requests", func() {
+			res := retry(2500*time.Millisecond, fetchAppearingAt(-1, 200*time.Millisecond))
+			Expect(res.Stop).To(Equal(stopDeadline))
+			Expect(res.Waited).To(BeNumerically(">=", 2500*time.Millisecond))
+			Expect(res.Waited).To(BeNumerically("<", 3500*time.Millisecond))
 		})
 
-		It("still finds a segment that lands during the promote grace", func() {
-			p := t0.Add(500 * time.Millisecond)
-			promoted = &p
-			outcome, _, _ := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(2500*time.Millisecond, 200*time.Millisecond))
-			Expect(outcome).To(Equal(fetchFound))
+		It("makes a single fetch when the budget is spent", func() {
+			res := retry(0, fetchAppearingAt(-1, 200*time.Millisecond))
+			Expect(res.Outcome).To(Equal(fetchNotFound))
+			Expect(res.Attempts).To(Equal(1))
+			Expect(res.Stop).To(Equal(stopDeadline))
 		})
 
 		It("does not retry other errors", func() {
 			calls := 0
-			outcome, attempts, _ := fetchWithTargetRetry(context.Background(), cfg, env, func(context.Context) fetchOutcome {
+			res := retry(cfg.Timeout, func(context.Context) fetchOutcome {
 				calls++
 				return fetchFailed
 			})
-			Expect(outcome).To(Equal(fetchFailed))
-			Expect(attempts).To(Equal(1))
+			Expect(res.Outcome).To(Equal(fetchFailed))
+			Expect(res.Attempts).To(Equal(1))
 			Expect(calls).To(Equal(1))
-		})
-
-		It("makes a single attempt with a zero timeout", func() {
-			cfg.Timeout = 0
-			outcome, attempts, stop := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(-1, 200*time.Millisecond))
-			Expect(outcome).To(Equal(fetchNotFound))
-			Expect(attempts).To(Equal(1))
-			Expect(stop).To(Equal(stopDeadline))
 		})
 
 		It("stops when the request context is closed", func() {
 			env.sleep = func(context.Context, time.Duration) error { return context.Canceled }
-			_, attempts, stop := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(-1, 0))
-			Expect(attempts).To(Equal(1))
-			Expect(stop).To(Equal(stopContextClosed))
+			res := retry(cfg.Timeout, fetchAppearingAt(-1, 0))
+			Expect(res.Attempts).To(Equal(1))
+			Expect(res.Stop).To(Equal(stopContextClosed))
 		})
 	})
 
-	Describe("promote request detection", func() {
-		It("sees promote.signal in PGDATA", func() {
-			dir := GinkgoT().TempDir()
-			env := realRetryEnv(dir)
-			Expect(env.promoteRequested()).To(BeFalse())
-			Expect(os.WriteFile(filepath.Join(dir, promoteSignalFile), nil, 0o600)).To(Succeed())
-			Expect(env.promoteRequested()).To(BeTrue())
-			Expect(realRetryEnv("").promoteRequested()).To(BeFalse())
+	Describe("switchoverRetryState", func() {
+		It("budgets the wait per switchover", func() {
+			var st switchoverRetryState
+			Expect(st.begin("db-2@t1", 10*time.Second)).To(Equal(10 * time.Second))
+			st.end("db-2@t1", 7*time.Second)
+			Expect(st.begin("db-2@t1", 10*time.Second)).To(Equal(3 * time.Second))
+			st.end("db-2@t1", 5*time.Second)
+			Expect(st.begin("db-2@t1", 10*time.Second)).To(BeZero())
+
+			// A new switchover starts afresh; a late report of the old one is dropped.
+			Expect(st.begin("db-3@t2", 10*time.Second)).To(Equal(10 * time.Second))
+			st.end("db-2@t1", 9*time.Second)
+			Expect(st.begin("db-3@t2", 10*time.Second)).To(Equal(10 * time.Second))
 		})
 	})
 
@@ -283,26 +270,24 @@ var _ = Describe("Switchover WAL guard", func() {
 		AfterEach(func() {
 			viper.Set(SwitchoverTargetRetryTimeoutKey, nil)
 			viper.Set(SwitchoverTargetRetryIntervalKey, nil)
-			viper.Set(SwitchoverTargetPromoteGraceKey, nil)
 		})
 
 		It("uses the defaults when nothing is set", func() {
 			Expect(targetRetryConfigFromViper()).To(Equal(targetRetryConfig{
-				Timeout:      DefaultSwitchoverTargetRetryTimeout,
-				Interval:     DefaultSwitchoverTargetRetryInterval,
-				PromoteGrace: DefaultSwitchoverTargetPromoteGrace,
+				Timeout:  DefaultSwitchoverTargetRetryTimeout,
+				Interval: DefaultSwitchoverTargetRetryInterval,
 			}))
 		})
 
 		It("reads durations and bare seconds, and ignores invalid values", func() {
 			viper.Set(SwitchoverTargetRetryTimeoutKey, "15")
-			viper.Set(SwitchoverTargetRetryIntervalKey, "500ms")
-			viper.Set(SwitchoverTargetPromoteGraceKey, "soon")
+			viper.Set(SwitchoverTargetRetryIntervalKey, "soon")
 			Expect(targetRetryConfigFromViper()).To(Equal(targetRetryConfig{
-				Timeout:      15 * time.Second,
-				Interval:     500 * time.Millisecond,
-				PromoteGrace: DefaultSwitchoverTargetPromoteGrace,
+				Timeout:  15 * time.Second,
+				Interval: DefaultSwitchoverTargetRetryInterval,
 			}))
+			viper.Set(SwitchoverTargetRetryIntervalKey, "500ms")
+			Expect(targetRetryConfigFromViper().Interval).To(Equal(500 * time.Millisecond))
 		})
 
 		It("accepts 0 to disable the retry but not a zero interval", func() {

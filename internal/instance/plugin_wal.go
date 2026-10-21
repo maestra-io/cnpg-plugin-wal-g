@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cloudnative-pg/cnpg-i/pkg/wal"
 	"github.com/go-logr/logr"
@@ -54,8 +55,6 @@ type WALServiceImplementation struct {
 	// PodName is the instance this sidecar runs in (POD_NAME); the
 	// switchover guard compares it with status.targetPrimary.
 	PodName string
-	// PGDataPath is PGDATA; the switchover guard looks for promote.signal there.
-	PGDataPath string
 }
 
 // GetCapabilities implements the WALService interface
@@ -153,13 +152,14 @@ func (w WALServiceImplementation) Restore(
 	}
 
 	action := restoreNormally
+	decidedOn := cluster
 	if viper.GetString("mode") == common.PluginModeNormal {
 		// Two views of the Cluster: the sidecar's own watch and the instance
 		// manager's copy in the request. Either may lag; a switchover seen in
 		// either one counts, since guarding a bit too long only delays a fetch.
 		var reason string
 		// The opt-out parameters are taken from the fresher (watched) copy.
-		decidedOn := w.liveCluster(ctx, cluster)
+		decidedOn = w.liveCluster(ctx, cluster)
 		opts := switchoverGuardOptionsFromCluster(decidedOn)
 		action, reason = decideRestoreAction(decidedOn, w.PodName, request.SourceWalName, opts)
 		if action == restoreNormally && decidedOn != cluster {
@@ -190,7 +190,7 @@ func (w WALServiceImplementation) Restore(
 
 	var result *cmd.RunResult
 	if action == restoreRetryOnMiss {
-		result, err = w.fetchAsTargetPrimary(childrenCtx, logger, request.SourceWalName, fetch)
+		result, err = w.fetchAsTargetPrimary(childrenCtx, logger, decidedOn, request.SourceWalName, fetch)
 	} else {
 		result, err = fetch(childrenCtx)
 	}
@@ -226,19 +226,23 @@ func (w WALServiceImplementation) liveCluster(ctx context.Context, fromRequest *
 }
 
 // fetchAsTargetPrimary fetches walName for the switchover target primary,
-// polling the archive on "not found" (see switchover_guard.go).
+// polling the archive on "not found" within the switchover's retry budget
+// (see switchover_guard.go).
 func (w WALServiceImplementation) fetchAsTargetPrimary(
 	ctx context.Context,
 	logger logr.Logger,
+	cluster *cnpgv1.Cluster,
 	walName string,
 	fetch func(ctx context.Context) (*cmd.RunResult, error),
 ) (*cmd.RunResult, error) {
 	cfg := targetRetryConfigFromViper()
+	key := cluster.Status.TargetPrimary + "@" + cluster.Status.TargetPrimaryTimestamp
+	budget := targetRetryState.begin(key, cfg.Timeout)
 	var (
 		result *cmd.RunResult
 		err    error
 	)
-	outcome, attempts, stop := fetchWithTargetRetry(ctx, cfg, realRetryEnv(w.PGDataPath), func(fetchCtx context.Context) fetchOutcome {
+	res := fetchWithTargetRetry(ctx, cfg, realRetryEnv(), budget, func(fetchCtx context.Context) fetchOutcome {
 		result, err = fetch(fetchCtx)
 		switch {
 		case err == nil:
@@ -249,14 +253,17 @@ func (w WALServiceImplementation) fetchAsTargetPrimary(
 			return fetchFailed
 		}
 	})
-	switch outcome {
+	targetRetryState.end(key, res.Waited)
+	switch res.Outcome {
 	case fetchFound:
-		if attempts > 1 {
-			logger.Info(fmt.Sprintf("Switchover target primary: %s appeared in the archive after %d attempts", walName, attempts))
+		if res.Attempts > 1 {
+			logger.Info(fmt.Sprintf("Switchover target primary: %s appeared in the archive after %d attempts (%s)",
+				walName, res.Attempts, res.Waited.Round(time.Millisecond)))
 		}
 	case fetchNotFound:
-		logger.Info(fmt.Sprintf("Switchover target primary: %s still not in the archive after %d attempts (%s)", walName, attempts, stop),
-			"retryTimeout", cfg.Timeout.String(), "promoteGrace", cfg.PromoteGrace.String())
+		logger.Info(fmt.Sprintf("Switchover target primary: %s not in the archive after %d attempts over %s (%s)",
+			walName, res.Attempts, res.Waited.Round(time.Millisecond), res.Stop),
+			"budgetLeft", (budget - res.Waited).Round(time.Millisecond).String())
 	}
 	return result, err
 }

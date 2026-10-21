@@ -48,14 +48,23 @@ package instance
 //     such a record can reach it: its stream from the old primary is gone.
 //   - The target primary, on "not found", keeps polling the archive for a
 //     bounded time instead of answering at once, so the old primary's final
-//     segment is replayed before the promotion if it lands meanwhile. The fork
-//     then sits at the segment boundary, after the XLOG_SWITCH, and nothing in
-//     the archive is past it. The wait ends early once PostgreSQL has a promote
-//     request ($PGDATA/promote.signal, written by pg_ctl promote) and a fetch
-//     that started a grace period after that request also found nothing: CNPG
-//     promotes only after the old primary has shut down, and its final archiver
-//     cycle runs before it exits, so by then the segment is either there or
-//     never coming.
+//     segment is replayed before the promotion if it lands meanwhile.
+//     PostgreSQL cannot act on a promote request while restore_command runs,
+//     so the fork then sits at the segment boundary, after the XLOG_SWITCH,
+//     and nothing in the archive is past it. The wait is budgeted per
+//     switchover (keyed by status.targetPrimary and targetPrimaryTimestamp)
+//     and counted from the first miss, not per request: once the budget is
+//     spent, later requests of the same switchover (such as the
+//     end-of-recovery re-read of the last segment) get a single fetch.
+//     The first miss comes when the target's stream from the old primary
+//     ends; the old primary archives its final segment a few seconds later at
+//     most (the rest of its shutdown stall, then one wal-push), well inside
+//     the default 10 s.
+//
+//     There is deliberately no early exit on a promote request: while the
+//     target sits in restore_command its WAL receiver is not running, which is
+//     exactly what CNPG waits for before it promotes (waitForWalReceiverDown),
+//     so the promote request can come before the old primary's final upload.
 //
 // Both behaviors are on by default and can be turned off per Cluster with the
 // plugin parameters below. Timeline history files, .partial and .backup files
@@ -65,10 +74,10 @@ package instance
 import (
 	"context"
 	"encoding/hex"
-	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
@@ -85,23 +94,15 @@ const (
 	// target primary retry off ("false"). Default: on.
 	SwitchoverTargetRetryParameter = "switchoverTargetWALRetry"
 
-	// DefaultSwitchoverTargetRetryTimeout bounds how long one restore request
-	// of the target primary keeps polling for a missing segment.
+	// DefaultSwitchoverTargetRetryTimeout bounds how long, in total over one
+	// switchover, the target primary keeps polling for missing segments.
 	DefaultSwitchoverTargetRetryTimeout = 10 * time.Second
 	// DefaultSwitchoverTargetRetryInterval is the pause between two polls.
 	DefaultSwitchoverTargetRetryInterval = 1 * time.Second
-	// DefaultSwitchoverTargetPromoteGrace is how long after a promote request
-	// was first seen a fetch must have started for its "not found" to be final.
-	DefaultSwitchoverTargetPromoteGrace = 3 * time.Second
 
 	// walSegmentNameLength is the length of a WAL segment file name:
 	// 8 hex digits of timeline, 8 of log id, 8 of segment.
 	walSegmentNameLength = 24
-	// promoteSignalFile is the file pg_ctl promote creates in PGDATA.
-	promoteSignalFile = "promote.signal"
-	// promoteWatchStep is how often the target checks for promote.signal
-	// between two polls of the archive.
-	promoteWatchStep = 100 * time.Millisecond
 )
 
 // restoreAction is what Restore does with one request.
@@ -218,9 +219,9 @@ func decideRestoreAction(
 
 // targetRetryConfig bounds the target primary's polling.
 type targetRetryConfig struct {
-	Timeout      time.Duration
-	Interval     time.Duration
-	PromoteGrace time.Duration
+	// Timeout is the budget of one switchover, counted from the first miss.
+	Timeout  time.Duration
+	Interval time.Duration
 }
 
 // fetchOutcome is the result of one fetch attempt.
@@ -232,18 +233,16 @@ const (
 	fetchFailed
 )
 
-// retryEnv makes the retry loop testable without real time or files.
+// retryEnv makes the retry loop testable without real time.
 type retryEnv struct {
-	now              func() time.Time
-	sleep            func(ctx context.Context, d time.Duration) error
-	promoteRequested func() bool
+	now   func() time.Time
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // Viper keys (sidecar flags / env) of the target primary retry.
 const (
 	SwitchoverTargetRetryTimeoutKey  = "switchover-target-retry-timeout"
 	SwitchoverTargetRetryIntervalKey = "switchover-target-retry-interval"
-	SwitchoverTargetPromoteGraceKey  = "switchover-target-promote-grace"
 )
 
 // targetRetryConfigFromViper reads the retry bounds from the sidecar's flags
@@ -251,18 +250,14 @@ const (
 // A timeout of 0 means a single fetch (no retry).
 func targetRetryConfigFromViper() targetRetryConfig {
 	cfg := targetRetryConfig{
-		Timeout:      DefaultSwitchoverTargetRetryTimeout,
-		Interval:     DefaultSwitchoverTargetRetryInterval,
-		PromoteGrace: DefaultSwitchoverTargetPromoteGrace,
+		Timeout:  DefaultSwitchoverTargetRetryTimeout,
+		Interval: DefaultSwitchoverTargetRetryInterval,
 	}
 	if d, ok := durationFromViper(SwitchoverTargetRetryTimeoutKey); ok && d >= 0 {
 		cfg.Timeout = d
 	}
 	if d, ok := durationFromViper(SwitchoverTargetRetryIntervalKey); ok && d > 0 {
 		cfg.Interval = d
-	}
-	if d, ok := durationFromViper(SwitchoverTargetPromoteGraceKey); ok && d >= 0 {
-		cfg.PromoteGrace = d
 	}
 	return cfg
 }
@@ -284,7 +279,7 @@ func durationFromViper(key string) (time.Duration, bool) {
 	return d, true
 }
 
-func realRetryEnv(pgData string) retryEnv {
+func realRetryEnv() retryEnv {
 	return retryEnv{
 		now: time.Now,
 		sleep: func(ctx context.Context, d time.Duration) error {
@@ -300,13 +295,6 @@ func realRetryEnv(pgData string) retryEnv {
 				return nil
 			}
 		},
-		promoteRequested: func() bool {
-			if pgData == "" {
-				return false
-			}
-			_, err := os.Stat(path.Join(pgData, promoteSignalFile))
-			return err == nil
-		},
 	}
 }
 
@@ -315,77 +303,93 @@ type retryStopReason string
 
 const (
 	stopNone          retryStopReason = ""
-	stopDeadline      retryStopReason = "retry timeout reached"
-	stopPromote       retryStopReason = "promote requested and grace period passed"
+	stopDeadline      retryStopReason = "retry budget of this switchover used up"
 	stopContextClosed retryStopReason = "request context closed"
 )
 
+// switchoverRetryState is the target primary's retry budget for one
+// switchover. Restore requests of an instance are sequential (PostgreSQL's
+// startup process issues them); the mutex is for safety only.
+type switchoverRetryState struct {
+	mu    sync.Mutex
+	key   string
+	spent time.Duration
+}
+
+// targetRetryState is shared by all restore requests of this sidecar.
+var targetRetryState switchoverRetryState
+
+// begin returns the budget left for the switchover identified by key,
+// starting a new one if the key changed.
+func (s *switchoverRetryState) begin(key string, budget time.Duration) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.key != key {
+		s.key, s.spent = key, 0
+	}
+	if remaining := budget - s.spent; remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+// end records what one request of switchover key spent waiting.
+func (s *switchoverRetryState) end(key string, spent time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.key == key {
+		s.spent += spent
+	}
+}
+
+// retryResult is what fetchWithTargetRetry did.
+type retryResult struct {
+	Outcome  fetchOutcome
+	Attempts int
+	Stop     retryStopReason
+	Waited   time.Duration // time spent after the first miss
+}
+
 // fetchWithTargetRetry calls fetch until it finds the segment, fails with an
-// error other than "not found", or a stop condition holds on a miss:
-//   - the retry timeout since the first attempt has passed, or
-//   - a promote request was seen, and the attempt that just missed started at
-//     least PromoteGrace after it was first seen.
-//
-// It returns the last outcome, the number of attempts and, on a miss, why it
-// stopped.
+// error other than "not found", or budget (time after the first miss) is used
+// up. A zero budget means a single fetch.
 func fetchWithTargetRetry(
 	ctx context.Context,
 	cfg targetRetryConfig,
 	env retryEnv,
+	budget time.Duration,
 	fetch func(ctx context.Context) fetchOutcome,
-) (fetchOutcome, int, retryStopReason) {
-	start := env.now()
-	deadline := start.Add(cfg.Timeout)
-	var promoteSeen time.Time
-
-	for attempt := 1; ; attempt++ {
-		attemptStart := env.now()
-		if promoteSeen.IsZero() && env.promoteRequested() {
-			promoteSeen = attemptStart
+) retryResult {
+	var firstMiss, deadline time.Time
+	res := retryResult{}
+	done := func(outcome fetchOutcome, stop retryStopReason) retryResult {
+		res.Outcome, res.Stop = outcome, stop
+		if !firstMiss.IsZero() {
+			res.Waited = env.now().Sub(firstMiss)
 		}
+		return res
+	}
 
+	for {
+		res.Attempts++
 		outcome := fetch(ctx)
 		if outcome != fetchNotFound {
-			return outcome, attempt, stopNone
+			return done(outcome, stopNone)
 		}
 
 		now := env.now()
-		if promoteSeen.IsZero() && env.promoteRequested() {
-			promoteSeen = now
+		if firstMiss.IsZero() {
+			firstMiss, deadline = now, now.Add(budget)
 		}
 		if !now.Before(deadline) {
-			return outcome, attempt, stopDeadline
+			return done(outcome, stopDeadline)
 		}
-		if !promoteSeen.IsZero() && !attemptStart.Before(promoteSeen.Add(cfg.PromoteGrace)) {
-			return outcome, attempt, stopPromote
-		}
-
 		wake := now.Add(cfg.Interval)
 		if wake.After(deadline) {
 			wake = deadline
 		}
-		if !promoteSeen.IsZero() {
-			if graceEnd := promoteSeen.Add(cfg.PromoteGrace); graceEnd.After(now) && graceEnd.Before(wake) {
-				wake = graceEnd
-			}
-		}
-		// Sleep in short steps, watching for the promote request: the grace
-		// period starts when it is first seen, not at the next poll.
-		for now.Before(wake) {
-			step := wake.Sub(now)
-			if step > promoteWatchStep {
-				step = promoteWatchStep
-			}
-			if err := env.sleep(ctx, step); err != nil {
-				return outcome, attempt, stopContextClosed
-			}
-			now = env.now()
-			if promoteSeen.IsZero() && env.promoteRequested() {
-				promoteSeen = now
-				if graceEnd := now.Add(cfg.PromoteGrace); graceEnd.Before(wake) {
-					wake = graceEnd
-				}
-			}
+		if err := env.sleep(ctx, wake.Sub(now)); err != nil {
+			return done(outcome, stopContextClosed)
 		}
 	}
 }
