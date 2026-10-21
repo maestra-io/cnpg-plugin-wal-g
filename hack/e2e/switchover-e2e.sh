@@ -158,7 +158,9 @@ kubectl -n "$NS" create secret generic walg-creds \
 kubectl -n "$NS" create secret generic walg-encryption --from-literal=libsodiumKey="$(openssl rand -hex 32)"
 kubectl -n "$NS" create secret generic cdc-password --type=kubernetes.io/basic-auth \
     --from-literal=username=cdc --from-literal=password="$CDC_PASSWORD"
-kubectl apply -f - <<YAML
+# The plugin's webhook may refuse connections for a few seconds after the rollout.
+apply_backup_config() {
+    kubectl apply -f - <<YAML
 apiVersion: cnpg-extensions.yandex.cloud/v1beta1
 kind: BackupConfig
 metadata: {name: walg, namespace: $NS}
@@ -175,7 +177,10 @@ spec:
   encryption:
     method: libsodium
     encryptionSecret: walg-encryption
----
+YAML
+}
+wait_for "BackupConfig accepted by the plugin webhook" 180 apply_backup_config
+kubectl apply -f - <<YAML
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata: {name: pg, namespace: $NS}
@@ -333,6 +338,50 @@ switchover() { # switchover <old primary> <target> <third replica>
         note "switchover to $target: shutdown did not reproduce the incident's precondition (physical reaped=$reaped_phys, cdc reaped=$reaped_cdc); divergence checks above still apply"
     fi
     grep -h -E 'Switchover (in progress|target primary)' "$OUT/"*"-tl$new_tl-sidecar.log" | jq -Rr 'fromjson? | "\(.ts // "") \(.msg)"' | head -20 || true
+
+    # How long the target's PostgreSQL took to act on CNPG's promote request: the
+    # restore request in flight then is what the target retry can lengthen.
+    local promote_delay
+    promote_delay=$(python3 - "$OUT/$target-tl$new_tl.log" <<'PY'
+import json, sys
+from datetime import datetime
+def ts(v):
+    if isinstance(v, (int, float)):
+        from datetime import timezone
+        return datetime.fromtimestamp(v, timezone.utc)
+    v = v.replace(" UTC", "+00:00").replace("Z", "+00:00")
+    if "." in v:
+        head, rest = v.split(".", 1)
+        frac, tz = rest[:-6], rest[-6:]
+        v = f"{head}.{frac[:6].ljust(6, '0')}{tz}"
+    return datetime.fromisoformat(v.replace(" ", "T"))
+call = done = None
+def scan():
+    global call, done
+    for line in open(sys.argv[1]):
+        handle(line)
+def handle(line):
+    global call, done
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(e, dict):
+        return
+    msg = e.get("msg", "")
+    rec = e.get("record") or {}
+    if call is None and "applying WALs and promoting" in msg:
+        call = ts(e["ts"])
+    if call is not None and done is None and "received promote request" in rec.get("message", ""):
+        done = ts(rec.get("log_time") or e["ts"])
+try:
+    scan()
+    print(f"{(done - call).total_seconds():.1f}s" if call and done else "n/a")
+except Exception as err:
+    print(f"n/a ({err.__class__.__name__})")
+PY
+)
+    note "switchover to $target: PostgreSQL acted on the promote request $promote_delay after CNPG issued it"
 }
 
 STALLS=0

@@ -82,8 +82,8 @@ def stream():
             # Silent: no reads, no replies. The walsender times out; the next
             # read after that fails and we reconnect.
             time.sleep(1)
-            if time.monotonic() - freeze_at > 60:
-                raise RuntimeError("still connected 60s after going silent")
+            if time.monotonic() - freeze_at > 20:
+                raise RuntimeError("went silent 20s ago, reconnecting")
             continue
         msg = cur.read_message()
         if msg is not None:

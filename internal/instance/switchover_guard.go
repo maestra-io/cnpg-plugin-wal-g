@@ -99,6 +99,9 @@ const (
 	walSegmentNameLength = 24
 	// promoteSignalFile is the file pg_ctl promote creates in PGDATA.
 	promoteSignalFile = "promote.signal"
+	// promoteWatchStep is how often the target checks for promote.signal
+	// between two polls of the archive.
+	promoteWatchStep = 100 * time.Millisecond
 )
 
 // restoreAction is what Restore does with one request.
@@ -366,8 +369,23 @@ func fetchWithTargetRetry(
 				wake = graceEnd
 			}
 		}
-		if err := env.sleep(ctx, wake.Sub(now)); err != nil {
-			return outcome, attempt, stopContextClosed
+		// Sleep in short steps, watching for the promote request: the grace
+		// period starts when it is first seen, not at the next poll.
+		for now.Before(wake) {
+			step := wake.Sub(now)
+			if step > promoteWatchStep {
+				step = promoteWatchStep
+			}
+			if err := env.sleep(ctx, step); err != nil {
+				return outcome, attempt, stopContextClosed
+			}
+			now = env.now()
+			if promoteSeen.IsZero() && env.promoteRequested() {
+				promoteSeen = now
+				if graceEnd := now.Add(cfg.PromoteGrace); graceEnd.Before(wake) {
+					wake = graceEnd
+				}
+			}
 		}
 	}
 }

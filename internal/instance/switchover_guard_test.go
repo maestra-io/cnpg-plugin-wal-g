@@ -226,10 +226,12 @@ var _ = Describe("Switchover WAL guard", func() {
 			outcome, _, stop := fetchWithTargetRetry(context.Background(), cfg, env, fetchAppearingAt(-1, 200*time.Millisecond))
 			Expect(outcome).To(Equal(fetchNotFound))
 			Expect(stop).To(Equal(stopPromote))
-			// The deciding fetch started at least PromoteGrace after the promote request was first seen.
+			// The promote request is seen within one watch step, and the deciding fetch
+			// started PromoteGrace after that.
 			last := starts[len(starts)-1]
 			Expect(last).To(BeNumerically(">=", 1*time.Second+cfg.PromoteGrace))
-			Expect(clock.Sub(t0)).To(BeNumerically("<", 5*time.Second))
+			Expect(last).To(BeNumerically("<=", 1*time.Second+promoteWatchStep+cfg.PromoteGrace))
+			Expect(clock.Sub(t0)).To(BeNumerically("<", 4500*time.Millisecond))
 		})
 
 		It("still finds a segment that lands during the promote grace", func() {
