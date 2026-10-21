@@ -58,8 +58,8 @@ package instance
 //     end-of-recovery re-read of the last segment) get a single fetch.
 //     The first miss comes when the target's stream from the old primary
 //     ends; the old primary archives its final segment a few seconds later at
-//     most (the rest of its shutdown stall, then one wal-push), well inside
-//     the default 10 s.
+//     most (the rest of its shutdown stall, then one wal-push; 3.6 s at most
+//     in production and in the e2e), inside the default 5 s.
 //
 //     There is deliberately no early exit on a promote request: while the
 //     target sits in restore_command its WAL receiver is not running, which is
@@ -96,7 +96,7 @@ const (
 
 	// DefaultSwitchoverTargetRetryTimeout bounds how long, in total over one
 	// switchover, the target primary keeps polling for missing segments.
-	DefaultSwitchoverTargetRetryTimeout = 10 * time.Second
+	DefaultSwitchoverTargetRetryTimeout = 5 * time.Second
 	// DefaultSwitchoverTargetRetryInterval is the pause between two polls.
 	DefaultSwitchoverTargetRetryInterval = 1 * time.Second
 

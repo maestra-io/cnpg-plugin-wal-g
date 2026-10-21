@@ -163,7 +163,7 @@ var _ = Describe("Switchover WAL guard", func() {
 		BeforeEach(func() {
 			t0 = time.Date(2026, 10, 21, 0, 13, 58, 0, time.UTC)
 			clock = t0
-			cfg = targetRetryConfig{Timeout: 10 * time.Second, Interval: time.Second}
+			cfg = targetRetryConfig{Timeout: DefaultSwitchoverTargetRetryTimeout, Interval: time.Second}
 			env = retryEnv{
 				now: func() time.Time { return clock },
 				sleep: func(_ context.Context, d time.Duration) error {
@@ -190,6 +190,10 @@ var _ = Describe("Switchover WAL guard", func() {
 			return fetchWithTargetRetry(context.Background(), cfg, env, budget, fetch)
 		}
 
+		It("defaults to a 5 s budget per switchover", func() {
+			Expect(DefaultSwitchoverTargetRetryTimeout).To(Equal(5 * time.Second))
+		})
+
 		It("returns at once when the segment is there", func() {
 			res := retry(cfg.Timeout, fetchAppearingAt(0, 200*time.Millisecond))
 			Expect(res.Outcome).To(Equal(fetchFound))
@@ -212,9 +216,9 @@ var _ = Describe("Switchover WAL guard", func() {
 			res := retry(cfg.Timeout, fetchAppearingAt(-1, 200*time.Millisecond))
 			Expect(res.Outcome).To(Equal(fetchNotFound))
 			Expect(res.Stop).To(Equal(stopDeadline))
-			Expect(res.Attempts).To(BeNumerically(">=", 9))
-			Expect(res.Waited).To(BeNumerically(">=", 10*time.Second))
-			Expect(res.Waited).To(BeNumerically("<", 11*time.Second))
+			Expect(res.Attempts).To(BeNumerically(">=", 5))
+			Expect(res.Waited).To(BeNumerically(">=", 5*time.Second))
+			Expect(res.Waited).To(BeNumerically("<", 6*time.Second))
 		})
 
 		It("uses only the budget left over from earlier requests", func() {
