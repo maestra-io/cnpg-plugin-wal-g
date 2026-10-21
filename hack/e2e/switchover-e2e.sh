@@ -21,6 +21,10 @@
 #     WAL segment boundary, i.e. the target replayed the old primary's final
 #     XLOG_SWITCH from the archive before promoting, and the non-target
 #     replica's sidecar withheld old-timeline segments meanwhile.
+# Then a control switchover (pg-3 -> pg-1) with both behaviors turned off through
+# the plugin parameters: under the same precondition the new timeline must fork
+# mid-segment, before the old primary's final XLOG_SWITCH (the bug), proving the
+# test tells the fix from no fix. Divergence there is reported, not failed on.
 #
 # Needs: docker (IMAGE already built), kind, kubectl, helm, jq.
 #   IMAGE=docker.io/local/cnpg-plugin-wal-g:e2e hack/e2e/switchover-e2e.sh
@@ -268,8 +272,11 @@ consumer_attached() { # consumer_attached <primary>: the consumer streams from <
 }
 
 # ---------------------------------------------------------------- switchovers
-switchover() { # switchover <old primary> <target> <third replica>
-    local old=$1 target=$2 third=$3
+switchover() { # switchover <old primary> <target> <third replica> [control]
+    # "control": the guard is switched off; the run must then show the bug (a fork
+    # before the old primary's final XLOG_SWITCH), or the test cannot tell the fix
+    # from no fix. Divergence is only reported then, not failed on.
+    local old=$1 target=$2 third=$3 mode=${4:-guarded}
     wait_for "consumer attached to $old" 300 consumer_attached "$old"
     # Let the consumer confirm a commit and fall behind on the trailing WAL.
     sleep 3
@@ -310,10 +317,14 @@ switchover() { # switchover <old primary> <target> <third replica>
         [[ $(psql_in "$1" "select status || ':' || received_tli from pg_stat_wal_receiver") == "streaming:$new_tl" ]] &&
         [[ $(psql_in "$target" "select count(*) from pg_stat_replication where application_name = '$1' and state = 'streaming'") == 1 ]]
     }
-    wait_for "$third streams timeline $new_tl from $target" 180 replica_streams "$third"
-    wait_for "$old streams timeline $new_tl from $target" 300 replica_streams "$old"
-    # A diverged replica keeps retrying; give it time to say so.
-    sleep 20
+    if [ "$mode" = control ]; then
+        sleep 45
+    else
+        wait_for "$third streams timeline $new_tl from $target" 180 replica_streams "$third"
+        wait_for "$old streams timeline $new_tl from $target" 300 replica_streams "$old"
+        # A diverged replica keeps retrying; give it time to say so.
+        sleep 20
+    fi
 
     local diverged=""
     for pod in pg-1 pg-2 pg-3; do
@@ -323,8 +334,12 @@ switchover() { # switchover <old primary> <target> <third replica>
             diverged+=" $pod"
         fi
     done
-    [ -z "$diverged" ] || fail "timeline divergence after switchover to $target on:$diverged"
-    pass "switchover $old -> $target: timeline $old_tl -> $new_tl, $third and $old stream from $target, no instance diverged"
+    if [ "$mode" = control ]; then
+        note "control switchover $old -> $target (guard off): diverged instances:${diverged:- none}"
+    else
+        [ -z "$diverged" ] || fail "timeline divergence after switchover to $target on:$diverged"
+        pass "switchover $old -> $target: timeline $old_tl -> $new_tl, $third and $old stream from $target, no instance diverged"
+    fi
 
     # Did the incident's precondition occur? The old primary's shutdown stalled on the
     # logical walsender and both physical walsenders were reaped before the
@@ -346,7 +361,13 @@ switchover() { # switchover <old primary> <target> <third replica>
 
     # The precondition: the shutdown stalled on the cdc walsender, and both streams
     # were gone before the shutdown checkpoint (so before the XLOG_SWITCH).
-    if (( reaped_cdc > 0 && cut == 2 )) && [ -n "$shut_ckpt" ] && [[ "$cut_at" < "$shut_ckpt" ]]; then
+    if [ "$mode" = control ]; then
+        (( reaped_cdc > 0 && cut == 2 )) && [ -n "$shut_ckpt" ] && [[ "$cut_at" < "$shut_ckpt" ]] ||
+            fail "control switchover did not reproduce the precondition (cdc reaped=$reaped_cdc, cut=$cut at $cut_at, shutdown checkpoint '$shut_ckpt')"
+        [ "$offset" != 0 ] ||
+            fail "control switchover (guard off) still forked at a segment boundary: the e2e does not tell the fix from no fix"
+        pass "control (guard off): same precondition, the target promoted without the old primary's final segment, fork mid-segment at $switchpoint"
+    elif (( reaped_cdc > 0 && cut == 2 )) && [ -n "$shut_ckpt" ] && [[ "$cut_at" < "$shut_ckpt" ]]; then
         [ "$offset" = 0 ] || fail "stalled shutdown, streams reaped, and the fork $switchpoint is mid-segment: the target promoted without the old primary's final segment"
         grep -q "Switchover target primary: " "$OUT/$target-tl$new_tl-sidecar.log" ||
             grep -q '"switchoverGuard":"retry-on-miss"' "$OUT/$target-tl$new_tl-sidecar.log" ||
@@ -409,6 +430,20 @@ STALLS=0
 switchover pg-1 pg-2 pg-3
 switchover pg-2 pg-3 pg-1
 (( STALLS > 0 )) || fail "neither switchover reproduced the stalled shutdown; the test proves nothing about the race"
+
+# Control: the same switchover with both guard behaviors off (plugin parameters,
+# read per request, so no restart). Plugin parameters are not part of the pod
+# spec the plugin injects, so this must not roll the instances.
+uids_before=$(kubectl -n "$NS" get pods -l cnpg.io/cluster=pg -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{end}')
+kubectl -n "$NS" patch clusters.postgresql.cnpg.io pg --type=json -p \
+    '[{"op":"add","path":"/spec/plugins/0/parameters/switchoverReplicaWALGuard","value":"false"},
+      {"op":"add","path":"/spec/plugins/0/parameters/switchoverTargetWALRetry","value":"false"}]'
+sleep 30
+uids_after=$(kubectl -n "$NS" get pods -l cnpg.io/cluster=pg -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{end}')
+[ "$uids_before" = "$uids_after" ] || fail "turning the guard off re-created instance pods"
+[ "$(cluster_status currentPrimary)" = pg-3 ] || fail "primary moved after the parameter change"
+pass "plugin parameters switchoverReplicaWALGuard/switchoverTargetWALRetry=false applied without a rollout"
+switchover pg-3 pg-1 pg-2 control
 
 echo
 echo "================ switchover e2e summary ($IMAGE)"
