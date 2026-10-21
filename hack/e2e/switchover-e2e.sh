@@ -21,7 +21,9 @@
 #     WAL segment boundary, i.e. the target replayed the old primary's final
 #     XLOG_SWITCH from the archive before promoting, and the non-target
 #     replica's sidecar withheld old-timeline segments meanwhile.
-# Then a control switchover (pg-3 -> pg-1) with both behaviors turned off through
+# The second switchover promotes the target by hand before the old primary's final
+# segment exists (see switchover()). Then a control switchover (pg-3 -> pg-1, the
+# same early promote) with both behaviors turned off through
 # the plugin parameters: under the same precondition the new timeline must fork
 # mid-segment, before the old primary's final XLOG_SWITCH (the bug), proving the
 # test tells the fix from no fix. Divergence there is reported, not failed on.
@@ -272,11 +274,16 @@ consumer_attached() { # consumer_attached <primary>: the consumer streams from <
 }
 
 # ---------------------------------------------------------------- switchovers
-switchover() { # switchover <old primary> <target> <third replica> [control]
-    # "control": the guard is switched off; the run must then show the bug (a fork
-    # before the old primary's final XLOG_SWITCH), or the test cannot tell the fix
-    # from no fix. Divergence is only reported then, not failed on.
-    local old=$1 target=$2 third=$3 mode=${4:-guarded}
+switchover() { # switchover <old primary> <target> <third replica> [early-promote|control]
+    # early-promote: right after the streams are cut, promote the target ourselves,
+    #   before the old primary's final segment exists (CNPG itself promotes only
+    #   after the old primary is down; with a slow archive its last restore attempt
+    #   can still be a stale miss, which is what happened in production). The guard
+    #   must still make the target replay that segment before it acts on the promote.
+    # control: early-promote with the guard switched off; the run must then show the
+    #   bug (a fork before the old primary's final XLOG_SWITCH), or the test cannot
+    #   tell the fix from no fix. Divergence is only reported then, not failed on.
+    local old=$1 target=$2 third=$3 mode=${4:-natural}
     wait_for "consumer attached to $old" 300 consumer_attached "$old"
     # Let the consumer confirm a commit and fall behind on the trailing WAL.
     sleep 3
@@ -306,6 +313,10 @@ switchover() { # switchover <old primary> <target> <third replica> [control]
         fi
     done
     log "cut the WAL streams of $cut standbys at $cut_at"
+    if [ "$mode" != natural ]; then
+        kubectl -n "$NS" exec "$target" -c postgres -- pg_ctl promote -D /var/lib/postgresql/data/pgdata
+        log "promoted $target by hand at $(date -u '+%H:%M:%S.%3N')"
+    fi
 
     wait_for "$target is the current primary" 300 bash -c "[[ \$(kubectl -n $NS get clusters.postgresql.cnpg.io pg -o jsonpath='{.status.currentPrimary}') == $target ]]"
     local new_tl
@@ -366,7 +377,7 @@ switchover() { # switchover <old primary> <target> <third replica> [control]
             fail "control switchover did not reproduce the precondition (cdc reaped=$reaped_cdc, cut=$cut at $cut_at, shutdown checkpoint '$shut_ckpt')"
         [ "$offset" != 0 ] ||
             fail "control switchover (guard off) still forked at a segment boundary: the e2e does not tell the fix from no fix"
-        pass "control (guard off): same precondition, the target promoted without the old primary's final segment, fork mid-segment at $switchpoint"
+        pass "control (guard off, early promote): the target promoted without the old primary's final segment, fork mid-segment at $switchpoint"
     elif (( reaped_cdc > 0 && cut == 2 )) && [ -n "$shut_ckpt" ] && [[ "$cut_at" < "$shut_ckpt" ]]; then
         [ "$offset" = 0 ] || fail "stalled shutdown, streams reaped, and the fork $switchpoint is mid-segment: the target promoted without the old primary's final segment"
         grep -q "Switchover target primary: " "$OUT/$target-tl$new_tl-sidecar.log" ||
@@ -374,7 +385,7 @@ switchover() { # switchover <old primary> <target> <third replica> [control]
             fail "stall reproduced but the target's sidecar never took the switchover retry path"
         grep -q "Switchover in progress: not serving" "$OUT/$third-tl$new_tl-sidecar.log" ||
             note "$third never asked the archive for an old-timeline segment during the switchover"
-        pass "stalled shutdown reproduced (cdc walsender reaped, streams cut at $cut_at, shutdown checkpoint at $shut_ckpt): the target replayed the old primary's final segment, fork at segment boundary $switchpoint"
+        pass "stalled shutdown reproduced ($mode; cdc walsender reaped, streams cut at $cut_at, shutdown checkpoint at $shut_ckpt): the target replayed the old primary's final segment, fork at segment boundary $switchpoint"
         STALLS=$((STALLS + 1))
     else
         note "switchover to $target: shutdown did not reproduce the incident's precondition (cdc reaped=$reaped_cdc, streams cut=$cut at $cut_at, shutdown checkpoint '$shut_ckpt'); divergence checks above still apply"
@@ -428,7 +439,7 @@ PY
 
 STALLS=0
 switchover pg-1 pg-2 pg-3
-switchover pg-2 pg-3 pg-1
+switchover pg-2 pg-3 pg-1 early-promote
 (( STALLS > 0 )) || fail "neither switchover reproduced the stalled shutdown; the test proves nothing about the race"
 
 # Control: the same switchover with both guard behaviors off (plugin parameters,
