@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -308,15 +309,22 @@ func (c *BackupConfigStatusController) checkStorageWritable(
 }
 
 // reconcileWALStatus checks WAL integrity and evaluates recoverability points
-// by running `wal-g wal-show --detailed-json` across all known PG major versions
+// by running `wal-g wal-show --detailed-json` across all known PG major versions.
+//
+// Missing segments below the start segment of the earliest backup in storage
+// are not counted: no backup can need them for a restore. They show up after a
+// switch of the WAL archive (e.g. from barman to wal-g), where the new prefix
+// starts with a stray segment pushed before the first backup and the gap after
+// it holds segments the old archiver uploaded elsewhere. Gaps at or above the
+// earliest backup's start still fail the check, and so does any gap when the
+// prefix has no backup at all.
 func (c *BackupConfigStatusController) reconcileWALStatus(
 	ctx context.Context,
 	backupConfig *v1beta1.BackupConfig,
 	backupConfigWithSecrets *v1beta1.BackupConfigWithSecrets,
 	logger logr.Logger,
 ) {
-	allTimelinesOK := true
-	hasMissingSegments := false
+	total := walIntegrityResult{AllTimelinesOK: true}
 	var earliestBackupTime *time.Time
 
 	// Iterate over all known PG major versions to collect WAL info
@@ -330,17 +338,30 @@ func (c *BackupConfigStatusController) reconcileWALStatus(
 			continue
 		}
 
+		// The backup list is only needed to excuse missing segments.
+		var backups []walg.BackupMetadata
+		if lo.SomeBy(timelines, func(t walg.WALTimelineInfo) bool { return t.HasMissingSegments() }) {
+			backups, err = walgClient.GetBackupsList(ctx)
+			if err != nil {
+				logger.Info("Failed to list backups, counting every missing WAL segment",
+					"pgVersion", pgVersion, "error", err.Error())
+				backups = nil
+			}
+		}
+
+		result := evaluateWALIntegrity(timelines, backups)
+		total.merge(result)
+		if len(result.IgnoredMissingSegments) > 0 {
+			logger.Info("Ignoring missing WAL segments below the earliest backup",
+				"pgVersion", pgVersion, "earliestBackup", result.EarliestBackup,
+				"ignored", len(result.IgnoredMissingSegments),
+				"first", result.IgnoredMissingSegments[0],
+				"last", result.IgnoredMissingSegments[len(result.IgnoredMissingSegments)-1])
+		}
+
+		// Find the earliest backup start time across all timelines for first recoverability point
 		for i := range timelines {
 			timeline := &timelines[i]
-
-			if !timeline.IsOK() {
-				allTimelinesOK = false
-			}
-			if timeline.HasMissingSegments() {
-				hasMissingSegments = true
-			}
-
-			// Find the earliest backup start time across all timelines for first recoverability point
 			for j := range timeline.Backups {
 				startTime, err := timeline.Backups[j].StartTime()
 				if err != nil {
@@ -361,17 +382,21 @@ func (c *BackupConfigStatusController) reconcileWALStatus(
 	}
 
 	// Set WAL integrity condition
-	if allTimelinesOK && !hasMissingSegments {
+	if total.AllTimelinesOK && !total.HasMissingSegments {
+		message := "All WAL timelines are OK with no missing segments"
+		if n := len(total.IgnoredMissingSegments); n > 0 {
+			message += fmt.Sprintf(" (%d missing segments below the earliest backup ignored)", n)
+		}
 		setCondition(backupConfig, v1beta1.ConditionTypeWALIntegrityCheck, metav1.ConditionTrue,
-			"WALIntegrityCheckPassed", "All WAL timelines are OK with no missing segments")
+			"WALIntegrityCheckPassed", message)
 	} else {
 		reason := "WALIntegrityCheckFailed"
 		message := "WAL integrity issues detected:"
-		if !allTimelinesOK {
+		if !total.AllTimelinesOK {
 			message += " some timelines have non-OK status"
 		}
-		if hasMissingSegments {
-			if !allTimelinesOK {
+		if total.HasMissingSegments {
+			if !total.AllTimelinesOK {
 				message += ","
 			}
 			message += " missing WAL segments detected"
@@ -379,6 +404,87 @@ func (c *BackupConfigStatusController) reconcileWALStatus(
 		setCondition(backupConfig, v1beta1.ConditionTypeWALIntegrityCheck, metav1.ConditionFalse,
 			reason, message)
 	}
+}
+
+// walIntegrityResult is the WAL integrity verdict for one or more wal-g prefixes.
+type walIntegrityResult struct {
+	AllTimelinesOK     bool
+	HasMissingSegments bool
+	// IgnoredMissingSegments are missing segments below the earliest backup.
+	IgnoredMissingSegments []string
+	// EarliestBackup is the backup whose start segment set the cut-off.
+	EarliestBackup string
+}
+
+func (r *walIntegrityResult) merge(o walIntegrityResult) {
+	r.AllTimelinesOK = r.AllTimelinesOK && o.AllTimelinesOK
+	r.HasMissingSegments = r.HasMissingSegments || o.HasMissingSegments
+	r.IgnoredMissingSegments = append(r.IgnoredMissingSegments, o.IgnoredMissingSegments...)
+}
+
+// evaluateWALIntegrity judges `wal-g wal-show --detailed-json` timelines.
+// Missing segments whose position (log id, segment; the timeline is ignored)
+// is below the start segment of the earliest backup in backups are ignored,
+// and a timeline whose only problem was such segments counts as OK. Without
+// any backup every missing segment counts, as before.
+func evaluateWALIntegrity(timelines []walg.WALTimelineInfo, backups []walg.BackupMetadata) walIntegrityResult {
+	result := walIntegrityResult{AllTimelinesOK: true}
+
+	cutoff, haveCutoff := uint64(0), false
+	for i := range backups {
+		pos, ok := walSegmentPosition(backups[i].WalFileName)
+		if !ok {
+			continue
+		}
+		if !haveCutoff || pos < cutoff {
+			cutoff, haveCutoff = pos, true
+			result.EarliestBackup = backups[i].BackupName
+		}
+	}
+
+	for i := range timelines {
+		timeline := &timelines[i]
+		counted := 0
+		for _, segment := range timeline.MissingSegments {
+			if pos, ok := walSegmentPosition(segment); haveCutoff && ok && pos < cutoff {
+				result.IgnoredMissingSegments = append(result.IgnoredMissingSegments, segment)
+				continue
+			}
+			counted++
+		}
+		if counted > 0 {
+			result.HasMissingSegments = true
+		}
+
+		timelineOK := timeline.IsOK() ||
+			(timeline.Status == walg.TimelineStatusLostSegments && timeline.HasMissingSegments() && counted == 0)
+		if !timelineOK {
+			result.AllTimelinesOK = false
+		}
+	}
+	sort.Strings(result.IgnoredMissingSegments)
+	return result
+}
+
+// walSegmentPosition returns the position of a WAL segment name in the WAL
+// stream (log id and segment, the timeline left out), comparable across
+// timelines of one cluster.
+func walSegmentPosition(name string) (uint64, bool) {
+	if len(name) != 24 {
+		return 0, false
+	}
+	logID, err := strconv.ParseUint(name[8:16], 16, 32)
+	if err != nil {
+		return 0, false
+	}
+	seg, err := strconv.ParseUint(name[16:24], 16, 32)
+	if err != nil {
+		return 0, false
+	}
+	if _, err := strconv.ParseUint(name[0:8], 16, 32); err != nil {
+		return 0, false
+	}
+	return logID<<32 | seg, true
 }
 
 // reconcileBackupFields reconciles backup-related status fields by fetching backup metadata
