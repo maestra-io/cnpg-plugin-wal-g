@@ -41,7 +41,9 @@ type CNPGI struct {
 func (c *CNPGI) Start(ctx context.Context) error {
 	enrich := func(server *grpc.Server) error {
 		wal.RegisterWALServer(server, WALServiceImplementation{
-			Client: c.Client,
+			Client:     c.Client,
+			PodName:    c.InstanceName,
+			PGDataPath: c.PGDataPath,
 		})
 		backup.RegisterBackupServer(server, BackupServiceImplementation{
 			Client: c.Client,

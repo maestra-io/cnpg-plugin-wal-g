@@ -31,6 +31,35 @@ This plugin adds backup and restore functionality to [CloudNativePG](https://clo
 - [x] Monitoring
 - [x] `BackupConfig` Status displaying for last recoverability point, last successful backup, storage consumption
 
+## Switchover WAL guard
+
+During a switchover (`status.targetPrimary` differs from `status.currentPrimary`) the
+plugin changes how it serves WAL segments of the cluster's current timeline
+(`status.timelineID`, still the old primary's), to close the race of
+[cloudnative-pg#11715](https://github.com/cloudnative-pg/cloudnative-pg/issues/11715),
+where a replica restored the old primary's final segment from the archive and diverged
+past the new timeline's fork:
+
+- a replica that is not the target gets "not found" without an archive lookup, so it
+  waits and streams from the new primary;
+- the target primary polls the archive on "not found" for up to 10 s (1 s apart), so it
+  replays the old primary's final segment before it promotes. Once PostgreSQL has a
+  promote request (`promote.signal`), a "not found" from a fetch started 3 s after that
+  request was first seen is final.
+
+Timeline history, `.partial` and `.backup` files, replica clusters and full-recovery jobs
+are not affected. Knobs:
+
+| Where | Name | Default | Effect |
+|---|---|---|---|
+| Cluster `spec.plugins[].parameters` | `switchoverReplicaWALGuard` | `true` | `false` serves non-target replicas as before |
+| Cluster `spec.plugins[].parameters` | `switchoverTargetWALRetry` | `true` | `false` answers the target primary at once, as before |
+| sidecar env (e.g. Cluster `spec.env`) | `SWITCHOVER_TARGET_RETRY_TIMEOUT` | `10s` | longest poll per restore request; `0` disables it |
+| sidecar env | `SWITCHOVER_TARGET_RETRY_INTERVAL` | `1s` | pause between polls |
+| sidecar env | `SWITCHOVER_TARGET_PROMOTE_GRACE` | `3s` | see above; set it to the timeout to never stop early |
+
+Durations take Go syntax (`15s`, `500ms`); a bare number means seconds.
+
 ## Dependencies
 
 - [Kubernetes](https://kubernetes.io/releases/) version 1.28 or higher
