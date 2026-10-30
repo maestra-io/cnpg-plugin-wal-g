@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -60,48 +61,66 @@ func (w *WALTimelineInfo) IsOK() bool {
 	return w.Status == TimelineStatusOK
 }
 
-// StorageCheckReadable verifies that the configured storage is accessible for reading
-// by running `wal-g st check read`.
-func (c *Client) StorageCheckReadable(ctx context.Context) (*cmd.RunResult, error) {
-	logger := logr.FromContextOrDiscard(ctx)
+// DefaultStorageCheckTimeout is the default budget of a single `wal-g st check`
+// call. A storage latency blip (seen on Cloudflare R2) can stretch a healthy
+// check well past 15 s; 60 s keeps such a blip from failing the check.
+const DefaultStorageCheckTimeout = 60 * time.Second
 
-	commandCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+// StorageCheckReadable verifies that the configured storage is accessible for reading
+// by running `wal-g st check read`, bounded by timeout (DefaultStorageCheckTimeout if <= 0).
+func (c *Client) StorageCheckReadable(ctx context.Context, timeout time.Duration) (*cmd.RunResult, error) {
+	return c.storageCheck(ctx, "read", timeout)
+}
+
+// StorageCheckWritable verifies that the configured storage is accessible for writing
+// by running `wal-g st check write`, bounded by timeout (DefaultStorageCheckTimeout if <= 0).
+func (c *Client) StorageCheckWritable(ctx context.Context, timeout time.Duration) (*cmd.RunResult, error) {
+	return c.storageCheck(ctx, "write", timeout)
+}
+
+// storageCheck runs `wal-g st check <mode>`. It does not log at Error level:
+// the caller decides whether a failure is final (it may retry).
+func (c *Client) storageCheck(ctx context.Context, mode string, timeout time.Duration) (*cmd.RunResult, error) {
+	logger := logr.FromContextOrDiscard(ctx)
+	if timeout <= 0 {
+		timeout = DefaultStorageCheckTimeout
+	}
+
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := cmd.New("wal-g", "st", "check", "read").
+	result, err := cmd.New("wal-g", "st", "check", mode).
 		WithContext(commandCtx).
 		WithEnv(c.config.ToEnvMap()).
 		Run()
 
 	if err != nil {
-		logger.Error(
-			err, "Error while 'wal-g st check read'",
+		err = StorageCheckError(mode, timeout, err, commandCtx.Err(), ctx.Err())
+		logger.V(1).Info(
+			fmt.Sprintf("'wal-g st check %s' failed", mode), "error", err.Error(),
 			"stdout", string(result.Stdout()), "stderr", string(result.Stderr()),
 		)
-		return result, fmt.Errorf("storage read check failed: %w", err)
+		return result, err
 	}
 	return result, nil
 }
 
-// StorageCheckWritable verifies that the configured storage is accessible for writing
-// by running `wal-g st check write`.
-func (c *Client) StorageCheckWritable(ctx context.Context) (*cmd.RunResult, error) {
-	logger := logr.FromContextOrDiscard(ctx)
-
-	commandCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	result, err := cmd.New("wal-g", "st", "check", "write").
-		WithContext(commandCtx).
-		WithEnv(c.config.ToEnvMap()).
-		Run()
-
-	if err != nil {
-		logger.Error(
-			err, "Error while 'wal-g st check write'",
-			"stdout", string(result.Stdout()), "stderr", string(result.Stderr()),
-		)
-		return result, fmt.Errorf("storage write check failed: %w", err)
+// StorageCheckError builds the error of a failed `wal-g st check <mode>`.
+// When the check's own deadline killed wal-g (commandCtxErr is DeadlineExceeded
+// while the parent context is still live), the raw error is "signal: killed" /
+// "context deadline exceeded"; it is replaced by "timed out after <timeout>".
+func StorageCheckError(mode string, timeout time.Duration, runErr, commandCtxErr, parentCtxErr error) error {
+	if errors.Is(commandCtxErr, context.DeadlineExceeded) && parentCtxErr == nil {
+		return fmt.Errorf("storage %s check timed out after %s: %w", mode, formatSeconds(timeout), ErrStorageCheckTimeout)
 	}
-	return result, nil
+	return fmt.Errorf("storage %s check failed: %w", mode, runErr)
+}
+
+// ErrStorageCheckTimeout marks a storage check killed by its own deadline.
+var ErrStorageCheckTimeout = errors.New("wal-g st check exceeded its deadline")
+
+// formatSeconds renders a duration as whole or fractional seconds ("60s", "1.5s").
+func formatSeconds(d time.Duration) string {
+	return strconv.FormatFloat(d.Seconds(), 'f', -1, 64) + "s"
 }
 
 // WALShow retrieves detailed WAL timeline information by running `wal-g wal-show --detailed-json`.

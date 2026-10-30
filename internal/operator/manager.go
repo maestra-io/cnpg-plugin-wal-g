@@ -82,6 +82,11 @@ const (
 
 	// OperatorDeploymentLabelSelector is the labelSelector to be used to get the operators deployment
 	OperatorDeploymentLabelSelector = "app.kubernetes.io/name=cnpg-plugin-wal-g"
+
+	// StorageCheckTimeoutKey is the viper key (flag --storage-check-timeout,
+	// env STORAGE_CHECK_TIMEOUT) of the budget of one `wal-g st check` call of
+	// the BackupConfig status controller.
+	StorageCheckTimeoutKey = "storage-check-timeout"
 )
 
 func init() {
@@ -209,6 +214,7 @@ func Start(ctx context.Context) error {
 	backupConfigStatusController := controller.NewBackupConfigStatusController(
 		mgr.GetClient(),
 		2*time.Minute, // Run status reconciliation each 2 minutes
+		viper.GetDuration(StorageCheckTimeoutKey), // Budget of one 'wal-g st check' call
 	)
 	if err := mgr.Add(backupConfigStatusController); err != nil {
 		setupLog.Error(err, "unable to add controller", "controller", "BackupConfigStatusController")

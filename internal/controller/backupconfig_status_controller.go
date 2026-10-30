@@ -28,6 +28,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/samber/lo"
 	v1beta1 "github.com/wal-g/cnpg-plugin-wal-g/api/v1beta1"
+	"github.com/wal-g/cnpg-plugin-wal-g/internal/util/cmd"
 	"github.com/wal-g/cnpg-plugin-wal-g/pkg/walg"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,7 +46,20 @@ const (
 
 	// Size of the shared reconciliation request queue
 	statusReconcileQueueSize = 256
+
+	// Attempts of each storage check (`wal-g st check read|write`) per reconcile
+	// before its condition goes False: one retry rides out a storage latency blip.
+	storageCheckAttempts = 2
+
+	// Pause between two storage check attempts.
+	defaultStorageCheckRetryBackoff = 5 * time.Second
 )
+
+// storageChecker is the part of *walg.Client the storage checks use; tests mock it.
+type storageChecker interface {
+	StorageCheckReadable(ctx context.Context, timeout time.Duration) (*cmd.RunResult, error)
+	StorageCheckWritable(ctx context.Context, timeout time.Duration) (*cmd.RunResult, error)
+}
 
 // BackupConfigStatusController periodically reconciles BackupConfigStatus fields
 // for all BackupConfig resources. It uses a static goroutine pool with a single
@@ -57,6 +71,11 @@ const (
 type BackupConfigStatusController struct {
 	client        client.Client
 	checkInterval time.Duration
+
+	// storageCheckTimeout bounds a single `wal-g st check` call
+	storageCheckTimeout time.Duration
+	// storageCheckRetryBackoff is the pause between two storage check attempts
+	storageCheckRetryBackoff time.Duration
 
 	// queue is the single shared channel for all reconciliation requests
 	queue chan types.NamespacedName
@@ -71,13 +90,24 @@ type BackupConfigStatusController struct {
 	logger logr.Logger
 }
 
-// NewBackupConfigStatusController creates a new BackupConfigStatusController
-func NewBackupConfigStatusController(client client.Client, checkInterval time.Duration) *BackupConfigStatusController {
+// NewBackupConfigStatusController creates a new BackupConfigStatusController.
+// storageCheckTimeout bounds a single `wal-g st check` call; <= 0 means
+// walg.DefaultStorageCheckTimeout.
+func NewBackupConfigStatusController(
+	client client.Client,
+	checkInterval time.Duration,
+	storageCheckTimeout time.Duration,
+) *BackupConfigStatusController {
+	if storageCheckTimeout <= 0 {
+		storageCheckTimeout = walg.DefaultStorageCheckTimeout
+	}
 	return &BackupConfigStatusController{
-		client:        client,
-		checkInterval: checkInterval,
-		queue:         make(chan types.NamespacedName, statusReconcileQueueSize),
-		inFlight:      make(map[string]struct{}),
+		client:                   client,
+		checkInterval:            checkInterval,
+		storageCheckTimeout:      storageCheckTimeout,
+		storageCheckRetryBackoff: defaultStorageCheckRetryBackoff,
+		queue:                    make(chan types.NamespacedName, statusReconcileQueueSize),
+		inFlight:                 make(map[string]struct{}),
 	}
 }
 
@@ -86,6 +116,8 @@ func (c *BackupConfigStatusController) Start(ctx context.Context) error {
 	c.logger = ctrl.Log.WithName("BackupConfigStatusController")
 	c.logger.Info("Starting BackupConfig status controller",
 		"checkInterval", c.checkInterval,
+		"storageCheckTimeout", c.storageCheckTimeout,
+		"storageCheckAttempts", storageCheckAttempts,
 		"workers", maxStatusReconcileConcurrency,
 	)
 	ctx = logr.NewContext(ctx, c.logger)
@@ -274,12 +306,12 @@ func (c *BackupConfigStatusController) reconcileStatusByKey(
 func (c *BackupConfigStatusController) checkStorageReadable(
 	ctx context.Context,
 	backupConfig *v1beta1.BackupConfig,
-	walgClient *walg.Client,
+	checker storageChecker,
 	logger logr.Logger,
 ) bool {
-	_, err := walgClient.StorageCheckReadable(ctx)
+	err := c.runStorageCheck(ctx, "read", checker.StorageCheckReadable, logger)
 	if err != nil {
-		logger.Error(err, "Storage read check failed")
+		logger.Error(err, "Storage read check failed", "attempts", storageCheckAttempts)
 		setCondition(backupConfig, v1beta1.ConditionTypeStorageReadable, metav1.ConditionFalse,
 			"StorageReadCheckFailed", err.Error())
 	} else {
@@ -293,12 +325,12 @@ func (c *BackupConfigStatusController) checkStorageReadable(
 func (c *BackupConfigStatusController) checkStorageWritable(
 	ctx context.Context,
 	backupConfig *v1beta1.BackupConfig,
-	walgClient *walg.Client,
+	checker storageChecker,
 	logger logr.Logger,
 ) bool {
-	_, err := walgClient.StorageCheckWritable(ctx)
+	err := c.runStorageCheck(ctx, "write", checker.StorageCheckWritable, logger)
 	if err != nil {
-		logger.Error(err, "Storage write check failed")
+		logger.Error(err, "Storage write check failed", "attempts", storageCheckAttempts)
 		setCondition(backupConfig, v1beta1.ConditionTypeStorageWritable, metav1.ConditionFalse,
 			"StorageWriteCheckFailed", err.Error())
 	} else {
@@ -306,6 +338,52 @@ func (c *BackupConfigStatusController) checkStorageWritable(
 			"StorageWriteCheckPassed", "Storage is accessible for writing")
 	}
 	return err == nil
+}
+
+// runStorageCheck runs a storage check up to storageCheckAttempts times, each
+// call bounded by storageCheckTimeout, pausing storageCheckRetryBackoff between
+// attempts. All of it is bounded by ctx (the reconcile context). A failure that
+// is retried is logged at Info; the caller logs the final failure at Error.
+// It returns nil on the first success, else the last attempt's error.
+func (c *BackupConfigStatusController) runStorageCheck(
+	ctx context.Context,
+	mode string,
+	check func(context.Context, time.Duration) (*cmd.RunResult, error),
+	logger logr.Logger,
+) error {
+	var err error
+	for attempt := 1; attempt <= storageCheckAttempts; attempt++ {
+		if _, err = check(ctx, c.storageCheckTimeout); err == nil {
+			if attempt > 1 {
+				logger.Info(fmt.Sprintf("Storage %s check passed on attempt %d/%d", mode, attempt, storageCheckAttempts))
+			}
+			return nil
+		}
+		if attempt == storageCheckAttempts || ctx.Err() != nil {
+			break
+		}
+		logger.Info(fmt.Sprintf("Storage %s check attempt %d/%d failed, retrying", mode, attempt, storageCheckAttempts),
+			"error", err.Error(), "retryIn", c.storageCheckRetryBackoff)
+		if !sleepCtx(ctx, c.storageCheckRetryBackoff) {
+			break
+		}
+	}
+	return err
+}
+
+// sleepCtx waits for d or until ctx is done; it returns false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // reconcileWALStatus checks WAL integrity and evaluates recoverability points
