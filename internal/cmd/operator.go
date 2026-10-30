@@ -21,6 +21,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/wal-g/cnpg-plugin-wal-g/internal/operator"
+	"github.com/wal-g/cnpg-plugin-wal-g/pkg/walg"
 )
 
 func NewOperatorCmd() *cobra.Command {
@@ -82,6 +83,12 @@ func NewOperatorCmd() *cobra.Command {
 	cmd.Flags().String("cnpg-i-pg-sidecar-image", "cnpg-plugin-wal-g-instance-plugin:latest",
 		"Instance plugin image (with tag) to inject into postgres pod spec as a sidecar)")
 	_ = viper.BindPFlag("cnpg-i-pg-sidecar-image", cmd.Flags().Lookup("cnpg-i-pg-sidecar-image"))
+
+	cmd.Flags().Duration(operator.StorageCheckTimeoutKey, walg.DefaultStorageCheckTimeout,
+		"Budget of a single 'wal-g st check read|write' call of the BackupConfig status check. "+
+			"A failed check is retried once (5s later) before StorageReadable/StorageWritable go False.")
+	_ = viper.BindPFlag(operator.StorageCheckTimeoutKey, cmd.Flags().Lookup(operator.StorageCheckTimeoutKey))
+	_ = viper.BindEnv(operator.StorageCheckTimeoutKey, "STORAGE_CHECK_TIMEOUT")
 
 	cmd.Flags().String("cnpg-i-cert-path", "", "The directory that contains the CNPG-I GRPC server certificate.")
 	_ = viper.BindPFlag("cnpg-i-cert-path", cmd.Flags().Lookup("cnpg-i-cert-path"))

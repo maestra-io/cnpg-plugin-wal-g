@@ -60,6 +60,27 @@ are not affected. Knobs:
 
 Durations take Go syntax (`15s`, `500ms`); a bare number means seconds.
 
+## Storage availability check
+
+The controller's BackupConfig status loop (every 2 minutes) runs `wal-g st check read`
+and `wal-g st check write` against each BackupConfig's storage and sets the conditions
+`StorageReadable` / `StorageWritable`; the instance sidecar exports them as
+`cnpg_plugin_wal_g_s3_read_availability` / `cnpg_plugin_wal_g_s3_write_availability`.
+
+So that a storage latency blip does not flip them to `False` while WAL archiving is healthy:
+
+- each call has a **60 s** budget (`--storage-check-timeout`, env `STORAGE_CHECK_TIMEOUT`
+  of the controller; Go duration syntax);
+- a failed check is **retried once, 5 s later**, before its condition goes `False`. The
+  first failure is logged at Info (`Storage write check attempt 1/2 failed, retrying`),
+  only the final one at Error (`Storage write check failed`). Both attempts stay within
+  the 10-minute reconcile timeout;
+- a check killed by its own deadline reports `storage write check timed out after 60s`
+  instead of `signal: killed`.
+
+A storage that fails both attempts gives the same result as before: the condition is
+`False`, with the last error as its message, and the metric is `0`.
+
 ## Dependencies
 
 - [Kubernetes](https://kubernetes.io/releases/) version 1.28 or higher
