@@ -82,7 +82,7 @@ jobs:
           docker run --rm --entrypoint /usr/local/bin/wal-g "local/${IMAGE_REPOSITORY}:${IMAGE_TAG}" --version
 
       - name: Push image to ECR
-        uses: maestra-io/github-actions/push-to-aws-ecr-repository@main
+        uses: maestra-io/github-actions/push-to-aws-ecr-repository@11cf9f45e81486abdf2d1922306cb5a90feeea9b # v1.56.0
         with:
           awsRegion: ${{ env.AWS_REGION }}
           repositories: ${{ env.IMAGE_REPOSITORY }}
@@ -98,7 +98,7 @@ jobs:
           yq '.image' chart/values.yaml
 
       - name: Push chart to ECR
-        uses: maestra-io/github-actions/push-helm-chart-to-aws-ecr@main
+        uses: maestra-io/github-actions/push-helm-chart-to-aws-ecr@11cf9f45e81486abdf2d1922306cb5a90feeea9b # v1.56.0
         with:
           chartPath: chart
           version: ${{ steps.version.outputs.chart-version }}
