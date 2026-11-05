@@ -28,8 +28,18 @@ rules:
   - watch
 - apiGroups:
   - admissionregistration.k8s.io
+  resourceNames:
+  - cnpg-plugin-wal-g-mutating-webhook-configuration
   resources:
   - mutatingwebhookconfigurations
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resourceNames:
+  - cnpg-plugin-wal-g-validating-webhook-configuration
+  resources:
   - validatingwebhookconfigurations
   verbs:
   - get
@@ -110,11 +120,18 @@ rules:
   - rbac.authorization.k8s.io
   resources:
   - rolebindings
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
   - roles
   verbs:
   - create
   - get
   - list
   - patch
-  - update
   - watch
