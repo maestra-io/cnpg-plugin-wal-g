@@ -20,8 +20,9 @@ limitations under the License.
 package v1beta1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
 var (
@@ -29,10 +30,20 @@ var (
 	GroupVersion = schema.GroupVersion{Group: "cnpg-extensions.yandex.cloud", Version: "v1beta1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
-	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	// apimachinery's builder: controller-runtime's scheme.Builder is
+	// deprecated since controller-runtime v0.24.
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 
 	// AddToScheme adds the types in this group-version to the given scheme.
 	AddToScheme = SchemeBuilder.AddToScheme
 
 	BackupConfigKind = "BackupConfig"
 )
+
+// addKnownTypes registers this group-version's types, as controller-runtime's
+// scheme.Builder.Register did.
+func addKnownTypes(s *runtime.Scheme) error {
+	s.AddKnownTypes(GroupVersion, &BackupConfig{}, &BackupConfigList{})
+	metav1.AddToGroupVersion(s, GroupVersion)
+	return nil
+}
