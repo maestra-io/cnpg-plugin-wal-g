@@ -119,7 +119,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build --target=runtime -t ${DOCKER_IMG}:${DOCKER_TAG} .
+	$(CONTAINER_TOOL) build --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN --target=runtime -t ${DOCKER_IMG}:${DOCKER_TAG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -165,6 +165,7 @@ docker-buildx-init: ## Initialize docker buildx for cross-platform builds
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
 	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) \
+		--secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN \
 		--build-arg GIT_TAG="$(GIT_TAG)" \
 		--build-arg GIT_COMMIT="$(GIT_COMMIT)" \
 		--target=runtime \
