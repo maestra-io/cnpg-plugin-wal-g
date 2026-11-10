@@ -72,6 +72,10 @@ jobs:
       - name: Build binary and docker image
         run: make build docker-build
 
+      - name: nora token refresh log
+        if: failure()
+        run: cat "$RUNNER_TEMP/packages-token/refresh.log" 2>/dev/null || echo "no failed refreshes"
+
   helm-lint:
     name: Helm Lint
     runs-on: ubuntu-latest

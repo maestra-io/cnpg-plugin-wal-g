@@ -15,5 +15,12 @@ t=$(mint) && [ -n "$t" ] || { echo "::error::cannot mint the packages OIDC token
 echo "::add-mask::$t"
 write "$t"
 echo "PRIVATE_PACKAGES_TOKEN_FILE=$file" >> "$GITHUB_ENV"
-# Lives until the runner's orphan cleanup at the end of the job.
-( while sleep 60; do t=$(mint) && [ -n "$t" ] && write "$t"; done ) </dev/null >/dev/null 2>&1 &
+# Lives until the runner's orphan cleanup at the end of the job. Its output goes to a file, not
+# the step log: the runner stops reading this step's pipe when the step ends, so a later write
+# there would SIGPIPE the loop, and an ::add-mask:: from it would not be applied anyway. The
+# token itself is never printed; failed refreshes land in $dir/refresh.log (no token in it),
+# which the workflow prints when the job fails.
+( while sleep 60; do
+    if t=$(mint) && [ -n "$t" ]; then write "$t"
+    else echo "$(date -u +%FT%TZ) token refresh failed" >> "$dir/refresh.log"; fi
+  done ) </dev/null >/dev/null 2>&1 &
