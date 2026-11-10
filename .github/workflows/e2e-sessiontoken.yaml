@@ -41,7 +41,12 @@ env:
 jobs:
   e2e:
     name: kind + CNPG 1.30 + MinIO STS
+    # A fork PR gets no OIDC token, and the image needs nora: build only our own PRs and pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # nora OIDC token for the image build
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -52,9 +57,19 @@ jobs:
           sudo install -m 0755 kind /usr/local/bin/kind
           kind version; kubectl version --client; helm version; aws --version; jq --version
 
+      # Base images, apt and Go modules through nora (issues-maestra#1649): a credential helper
+      # mints a fresh GitHub OIDC token per credential read, and the RUN-mount secret is a file
+      # refreshed every 60 s.
+      - name: nora docker credentials
+        run: bash .github/scripts/nora-docker-credentials.sh
+
+      - name: nora token for the image build
+        run: bash .github/scripts/packages-token.sh
+
       - name: Build plugin image (runtime target, as release.yaml)
         run: |
           docker build --target=runtime \
+            --secret id=PRIVATE_PACKAGES_TOKEN,src="$PRIVATE_PACKAGES_TOKEN_FILE" \
             --build-arg GIT_TAG=v0.0.0-e2e --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
             -t "${IMAGE}" .
 
@@ -78,7 +93,12 @@ jobs:
   # See hack/e2e/switchover-e2e.sh.
   switchover:
     name: kind + CNPG 1.30 switchover with a stalled CDC client
+    # A fork PR gets no OIDC token, and the image needs nora: build only our own PRs and pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # nora OIDC token for the image build
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -89,9 +109,19 @@ jobs:
           sudo install -m 0755 kind /usr/local/bin/kind
           kind version; kubectl version --client; helm version; jq --version
 
+      # Base images, apt and Go modules through nora (issues-maestra#1649): a credential helper
+      # mints a fresh GitHub OIDC token per credential read, and the RUN-mount secret is a file
+      # refreshed every 60 s.
+      - name: nora docker credentials
+        run: bash .github/scripts/nora-docker-credentials.sh
+
+      - name: nora token for the image build
+        run: bash .github/scripts/packages-token.sh
+
       - name: Build plugin image (runtime target, as release.yaml)
         run: |
           docker build --target=runtime \
+            --secret id=PRIVATE_PACKAGES_TOKEN,src="$PRIVATE_PACKAGES_TOKEN_FILE" \
             --build-arg GIT_TAG=v0.0.0-e2e --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
             -t "${IMAGE}" .
 
