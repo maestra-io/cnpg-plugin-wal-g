@@ -46,7 +46,12 @@ jobs:
 
   build:
     name: Build
+    # A fork PR gets no OIDC token, and the image needs nora: build only our own PRs and pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # nora OIDC token for the image build
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -57,8 +62,21 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      # BuildKit pulls the base images through nora (packages.maestra.io, issues-maestra#1649).
+      # nora takes the GitHub OIDC token, which lives minutes: a credential helper mints a fresh
+      # one per credential read, and the RUN-mount secret is a file refreshed every 60 s.
+      - name: nora docker credentials
+        run: bash .github/scripts/nora-docker-credentials.sh
+
+      - name: nora token for the image build
+        run: bash .github/scripts/packages-token.sh
+
       - name: Build binary and docker image
         run: make build docker-build
+
+      - name: nora token refresh log
+        if: failure()
+        run: cat "$RUNNER_TEMP/packages-token/refresh.log" 2>/dev/null || echo "no failed refreshes"
 
   helm-lint:
     name: Helm Lint
