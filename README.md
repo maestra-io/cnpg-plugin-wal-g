@@ -136,7 +136,7 @@ Bootstrap local k8s cluster with kind
 Build docker image locally. Base images, apt and Go modules come from nora (`packages.maestra.io`), so log in and export an `nra_` token first:
 ```sh
 docker login packages.maestra.io -u token   # paste the nra_ token
-export PRIVATE_PACKAGES_TOKEN=<nra_ token>
+read -rs PRIVATE_PACKAGES_TOKEN && export PRIVATE_PACKAGES_TOKEN   # paste the nra_ token again
 make docker-build
 ```
 

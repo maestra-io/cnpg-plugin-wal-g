@@ -41,6 +41,8 @@ env:
 jobs:
   e2e:
     name: kind + CNPG 1.30 + MinIO STS
+    # A fork PR gets no OIDC token, and the image needs nora: build only our own PRs and pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -91,6 +93,8 @@ jobs:
   # See hack/e2e/switchover-e2e.sh.
   switchover:
     name: kind + CNPG 1.30 switchover with a stalled CDC client
+    # A fork PR gets no OIDC token, and the image needs nora: build only our own PRs and pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read

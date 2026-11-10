@@ -25,7 +25,8 @@ export PATH="$bin:$PATH"
 cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"; mkdir -p "$(dirname "$cfg")"
 [ -s "$cfg" ] || echo '{}' > "$cfg"
 # credHelpers wins over a stored auths entry for the host; drop a stale one anyway.
-jq '.credHelpers["packages.maestra.io"] = "nora" | del(.auths["packages.maestra.io"])' "$cfg" > "$cfg.t" \
-  && mv "$cfg.t" "$cfg"
+# Separate commands, not `jq … && mv`: set -e does not stop on a failure left of &&.
+jq '.credHelpers["packages.maestra.io"] = "nora" | del(.auths["packages.maestra.io"])' "$cfg" > "$cfg.t"
+mv "$cfg.t" "$cfg"
 # Prove the helper answers before the build depends on it.
 printf 'packages.maestra.io' | docker-credential-nora get | jq -e '.Secret | length > 0' >/dev/null
