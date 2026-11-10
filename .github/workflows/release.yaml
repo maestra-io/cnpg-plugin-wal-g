@@ -67,12 +67,22 @@ jobs:
           echo "image-tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "chart-version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # Base images, apt and Go modules through nora (issues-maestra#1649): a credential helper
+      # mints a fresh GitHub OIDC token per credential read, and the RUN-mount secret is a file
+      # refreshed every 60 s.
+      - name: nora docker credentials
+        run: bash .github/scripts/nora-docker-credentials.sh
+
+      - name: nora token for the image build
+        run: bash .github/scripts/packages-token.sh
+
       # linux/amd64 only: every Maestra cluster is x86-64.
       - name: Build image
         env:
           IMAGE_TAG: ${{ steps.version.outputs.image-tag }}
         run: |
           docker build --target=runtime \
+            --secret id=PRIVATE_PACKAGES_TOKEN,src="$PRIVATE_PACKAGES_TOKEN_FILE" \
             --build-arg GIT_TAG="${IMAGE_TAG}" \
             --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
             --label org.opencontainers.image.revision="${GITHUB_SHA}" \
@@ -105,3 +115,7 @@ jobs:
           appVersion: ${{ steps.version.outputs.image-tag }}
           awsRegion: ${{ env.AWS_REGION }}
           teleportToken: ${{ env.TELEPORT_TOKEN }}
+
+      - name: nora token refresh log
+        if: failure()
+        run: cat "$RUNNER_TEMP/packages-token/refresh.log" 2>/dev/null || echo "no failed refreshes"
