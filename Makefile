@@ -129,7 +129,7 @@ endif
 
 .PHONY: packages-token
 packages-token:
-	@[ -n "$(PRIVATE_PACKAGES_TOKEN_FILE)$(PRIVATE_PACKAGES_TOKEN)" ] || { \
+	@[ -n "$$PRIVATE_PACKAGES_TOKEN_FILE$$PRIVATE_PACKAGES_TOKEN" ] || { \
 		echo "ERROR: set PRIVATE_PACKAGES_TOKEN (an nra_ token for packages.maestra.io), see README"; exit 1; }
 
 .PHONY: docker-build
