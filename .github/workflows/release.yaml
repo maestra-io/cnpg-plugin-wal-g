@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write  # nora OIDC token: base images, apt and Go modules (issues-maestra#1649)
 
 jobs:
   # Prevents race conditions by creating the release only once before uploads.
@@ -57,6 +58,12 @@ jobs:
           platforms: arm64
       - name: Set up docker buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: nora docker credentials
+        run: bash .github/scripts/nora-docker-credentials.sh
+
+      - name: nora token for the image build
+        run: bash .github/scripts/packages-token.sh
+
       - name: Package and push release packages
         run: |
           make release

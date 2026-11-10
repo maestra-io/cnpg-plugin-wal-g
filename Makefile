@@ -117,9 +117,24 @@ build: manifests generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
 
+# apt and Go modules in the image build come from nora (packages.maestra.io, issues-maestra#1649):
+# BuildKit secret PRIVATE_PACKAGES_TOKEN. Locally: `docker login packages.maestra.io` (base images)
+# and `export PRIVATE_PACKAGES_TOKEN=<nra_ token>`. CI sets PRIVATE_PACKAGES_TOKEN_FILE instead, a
+# file it keeps fresh (BuildKit re-reads a secret file on each RUN mount).
+ifdef PRIVATE_PACKAGES_TOKEN_FILE
+PACKAGES_SECRET = --secret id=PRIVATE_PACKAGES_TOKEN,src=$(PRIVATE_PACKAGES_TOKEN_FILE)
+else
+PACKAGES_SECRET = --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN
+endif
+
+.PHONY: packages-token
+packages-token:
+	@[ -n "$(PRIVATE_PACKAGES_TOKEN_FILE)$(PRIVATE_PACKAGES_TOKEN)" ] || { \
+		echo "ERROR: set PRIVATE_PACKAGES_TOKEN (an nra_ token for packages.maestra.io), see README"; exit 1; }
+
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN --target=runtime -t ${DOCKER_IMG}:${DOCKER_TAG} .
+docker-build: packages-token ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build $(PACKAGES_SECRET) --target=runtime -t ${DOCKER_IMG}:${DOCKER_TAG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -163,9 +178,9 @@ docker-buildx-init: ## Initialize docker buildx for cross-platform builds
 	$(CONTAINER_TOOL) buildx inspect --bootstrap
 
 .PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
+docker-buildx: packages-token ## Build and push docker image for the manager for cross-platform support
 	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) \
-		--secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN \
+		$(PACKAGES_SECRET) \
 		--build-arg GIT_TAG="$(GIT_TAG)" \
 		--build-arg GIT_COMMIT="$(GIT_COMMIT)" \
 		--target=runtime \
