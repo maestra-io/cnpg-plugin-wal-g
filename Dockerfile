@@ -36,11 +36,14 @@ RUN git init -q $(go env GOPATH)/src/github.com/wal-g/wal-g && \
     git checkout -q FETCH_HEAD
 
 # Preparing && building necessary dependencies
+# go get: x/net >= 0.62.0 for CVE-2026-78661; WALG_COMMIT pins v0.60.0 (wal-g master
+# has 0.62.0). Drop it when WALG_COMMIT moves past that.
 RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,env=NORA_TOKEN,required=true \
     cd $(go env GOPATH)/src/github.com/wal-g/wal-g && \
     export GOPROXY="https://token:${NORA_TOKEN}@packages.maestra.io/go" && \
     export GOOS=${TARGETOS} && \
     export GOARCH=${TARGETARCH} && \
+    go get golang.org/x/net@v0.62.0 && \
     make deps
 
 # Build wal-g for postgresql (GOEXPERIMENT comes from wal-g's Makefile).
