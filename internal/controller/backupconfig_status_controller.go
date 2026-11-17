@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	v1beta1 "github.com/wal-g/cnpg-plugin-wal-g/api/v1beta1"
 	"github.com/wal-g/cnpg-plugin-wal-g/internal/util/cmd"
 	"github.com/wal-g/cnpg-plugin-wal-g/pkg/walg"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -269,8 +271,8 @@ func (c *BackupConfigStatusController) reconcileStatusByKey(
 		return c.client.Status().Update(ctx, backupConfig)
 	}
 
-	// Use a fixed PG version for storage checks (version doesn't matter for st check commands)
-	walgClient := walg.NewClientFromBackupConfig(backupConfigWithSecrets, 16)
+	// Storage checks run in their own folder, outside every archive (walg.StorageCheckFolder)
+	walgClient := walg.NewStorageCheckClient(backupConfigWithSecrets)
 
 	// Mark credentials as valid since we successfully fetched secrets
 	setCondition(backupConfig, v1beta1.ConditionTypeCredentialsValid, metav1.ConditionTrue,
@@ -605,6 +607,8 @@ func (c *BackupConfigStatusController) reconcileBackupTimestamps(
 		}
 	}
 
+	reconcileRetainedDeletions(backupConfig, relevantBackups)
+
 	if len(relevantBackups) == 0 {
 		return
 	}
@@ -806,4 +810,25 @@ func getConditionStatus(backupConfig *v1beta1.BackupConfig, conditionType string
 		}
 	}
 	return ""
+}
+
+// reconcileRetainedDeletions sets ConditionTypeBackupDeletionRetainedByLock while any
+// Backup of the BackupConfig is being deleted and its deletion was refused by a bucket
+// lock (BackupRetainedByLockAnnotationName), and removes the condition otherwise.
+func reconcileRetainedDeletions(backupConfig *v1beta1.BackupConfig, backups []cnpgv1.Backup) {
+	retained := make([]string, 0)
+	for i := range backups {
+		_, marked := backups[i].Annotations[v1beta1.BackupRetainedByLockAnnotationName]
+		if marked && !backups[i].DeletionTimestamp.IsZero() {
+			retained = append(retained, backups[i].Name)
+		}
+	}
+	if len(retained) == 0 {
+		meta.RemoveStatusCondition(&backupConfig.Status.Conditions, v1beta1.ConditionTypeBackupDeletionRetainedByLock)
+		return
+	}
+	sort.Strings(retained)
+	setCondition(backupConfig, v1beta1.ConditionTypeBackupDeletionRetainedByLock, metav1.ConditionTrue,
+		"RetainedByBucketLock", fmt.Sprintf("%d Backup(s) kept in storage by the bucket lock, deletion retried: %s",
+			len(retained), strings.Join(retained, ", ")))
 }

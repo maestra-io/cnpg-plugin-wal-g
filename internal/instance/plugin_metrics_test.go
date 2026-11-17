@@ -105,7 +105,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).NotTo(BeNil())
-			Expect(result.Metrics).To(HaveLen(8))
+			Expect(result.Metrics).To(HaveLen(9))
 
 			// Verify all expected metrics are defined
 			metricNames := make(map[string]bool)
@@ -124,6 +124,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 			Expect(metricNames).To(HaveKey(totalBackupsS3UsageBytesMetricName))
 			Expect(metricNames).To(HaveKey(s3ReadAvailabilityMetricName))
 			Expect(metricNames).To(HaveKey(s3WriteAvailabilityMetricName))
+			Expect(metricNames).To(HaveKey(backupDeletionRetainedByLockMetricName))
 		})
 	})
 
@@ -158,7 +159,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result).NotTo(BeNil())
-				Expect(result.Metrics).To(HaveLen(8))
+				Expect(result.Metrics).To(HaveLen(9))
 
 				// Verify storage metrics are zero when ConsumedStorage is nil
 				for _, metric := range result.Metrics {
@@ -430,6 +431,38 @@ var _ = Describe("MetricsServerImplementation", func() {
 				}
 			})
 
+			It("should report a deletion retained by the bucket lock", func() {
+				for _, retained := range []bool{true, false} {
+					backupConfig.Status.Conditions = nil
+					if retained {
+						backupConfig.Status.Conditions = []metav1.Condition{{
+							Type:   v1beta1.ConditionTypeBackupDeletionRetainedByLock,
+							Status: metav1.ConditionTrue,
+						}}
+					}
+					fakeClient := setupFakeClientForMetrics(backupConfig, cluster)
+					metricsServer = MetricsServerImplementation{Client: fakeClient}
+					clusterJSON, err := json.Marshal(cluster)
+					Expect(err).NotTo(HaveOccurred())
+
+					result, err := metricsServer.Collect(ctx, &metrics.CollectMetricsRequest{ClusterDefinition: clusterJSON})
+					Expect(err).NotTo(HaveOccurred())
+
+					found := false
+					for _, metric := range result.Metrics {
+						if metric.FqName == backupDeletionRetainedByLockMetricName {
+							found = true
+							want := float64(0)
+							if retained {
+								want = 1
+							}
+							Expect(metric.Value).To(Equal(want))
+						}
+					}
+					Expect(found).To(BeTrue())
+				}
+			})
+
 			It("should return zero when storage is not readable or writable", func() {
 				backupConfig.Status.Conditions = []metav1.Condition{
 					{
@@ -558,7 +591,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result).NotTo(BeNil())
-				Expect(result.Metrics).To(HaveLen(8))
+				Expect(result.Metrics).To(HaveLen(9))
 
 				// All metrics should have zero values
 				for _, metric := range result.Metrics {

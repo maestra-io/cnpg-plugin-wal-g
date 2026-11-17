@@ -17,8 +17,9 @@ ARG WALG_REPO=https://github.com/wal-g/wal-g
 # x/crypto v0.57.0, x/net v0.60.0, pgx/v5 v5.11.0 (trivy: 0 CRITICAL/HIGH).
 # Move back to a tag (set WALG_COMMIT to the tag's commit) once one ships.
 ARG WALG_COMMIT=ebd2e83f8e39b5997c7694616af14f68f05a3223
-# Stamped into `wal-g --version` (the Makefile reads it from the environment).
-ARG WALG_VERSION=v3.0.9-185-gebd2e83f
+# Stamped into `wal-g --version` (the Makefile reads it from the environment); the
+# suffix counts our patches below.
+ARG WALG_VERSION=v3.0.9-185-gebd2e83f-maestra.1
 
 # build arguments for wal-g
 ARG USE_BROTLI=1
@@ -35,6 +36,13 @@ RUN git init -q $(go env GOPATH)/src/github.com/wal-g/wal-g && \
     git fetch -q --depth 1 origin ${WALG_COMMIT} && \
     git checkout -q FETCH_HEAD
 
+# Our wal-g patches (hack/wal-g/*.patch, applied in name order, the build fails if one
+# does not apply): 0001 makes an R2 bucket lock refusal final and reads the per-key
+# errors of DeleteObjects (issues-maestra#1786).
+COPY hack/wal-g/ /wal-g-patches/
+RUN cd $(go env GOPATH)/src/github.com/wal-g/wal-g && \
+    git -c user.name=build -c user.email=build@localhost am -q /wal-g-patches/*.patch
+
 # Preparing && building necessary dependencies
 # go get: x/net >= 0.62.0 for CVE-2026-78661; WALG_COMMIT pins v0.60.0 (wal-g master
 # has 0.62.0). Drop it when WALG_COMMIT moves past that.
@@ -45,6 +53,13 @@ RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,env=NORA_TOKEN,required=true \
     export GOARCH=${TARGETARCH} && \
     go get golang.org/x/net@v0.62.0 && \
     make deps
+
+# Unit tests of the packages the patches touch (their own tests included).
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,env=NORA_TOKEN,required=true \
+    cd $(go env GOPATH)/src/github.com/wal-g/wal-g && \
+    export GOPROXY="https://token:${NORA_TOKEN}@packages.maestra.io/go" && \
+    go test ./pkg/storages/s3/ ./pkg/storages/storage/ ./internal/storagetools/ ./internal/multistorage/... \
+      ./internal/ ./internal/databases/postgres/
 
 # Build wal-g for postgresql (GOEXPERIMENT comes from wal-g's Makefile).
 # brotli, libsodium and lzo are linked statically (link_brotli.sh,

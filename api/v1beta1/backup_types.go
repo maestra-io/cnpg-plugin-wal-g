@@ -26,3 +26,8 @@ type BackupType string
 
 const BackupTypeFull BackupType = "full"
 const BackupTypeIncremental BackupType = "incremental"
+
+// BackupRetainedByLockAnnotationName is set on a Backup being deleted while an R2 bucket
+// lock refuses to delete it from storage. The value is the time of the first refusal.
+// The finalizer stays and the deletion is retried until the lock age has passed.
+const BackupRetainedByLockAnnotationName = "cnpg-plugin-wal-g.yandex.cloud/retained-by-bucket-lock"

@@ -120,7 +120,23 @@ func (c *Client) Config() *Config {
 	return c.config
 }
 
+// StorageCheckFolder is the folder under the BackupConfig prefix that `wal-g st check`
+// reads and writes: never an archive (those are <prefix>/<pg major>), so the write check's
+// probe objects stay out of the WAL and backup folders, and a bucket lifecycle rule can
+// expire the ones a bucket lock keeps from being deleted.
+const StorageCheckFolder = "storage-check"
+
+// NewStorageCheckClient returns a Client whose storage is <prefix>/storage-check.
+func NewStorageCheckClient(backupConfig *v1beta1.BackupConfigWithSecrets) *Client {
+	return NewClient(newConfigFromBackupConfig(backupConfig, StorageCheckFolder))
+}
+
 func NewConfigFromBackupConfig(backupConfig *v1beta1.BackupConfigWithSecrets, pgMajorVersion int) *Config {
+	return newConfigFromBackupConfig(backupConfig, strconv.Itoa(pgMajorVersion))
+}
+
+// newConfigFromBackupConfig builds the Config of the storage folder <prefix>/<folder>.
+func newConfigFromBackupConfig(backupConfig *v1beta1.BackupConfigWithSecrets, folder string) *Config {
 	config := NewConfigWithDefaults()
 
 	switch backupConfig.Spec.Storage.StorageType {
@@ -131,7 +147,7 @@ func NewConfigFromBackupConfig(backupConfig *v1beta1.BackupConfigWithSecrets, pg
 		config.AWSEndpoint = backupConfig.Spec.Storage.S3.ResolvedEndpointURL
 		config.AWSRegion = backupConfig.Spec.Storage.S3.ResolvedRegion
 		config.AWSS3ForcePathStyle = backupConfig.Spec.Storage.S3.ForcePathStyle
-		config.WaleS3Prefix = fmt.Sprintf("%s/%d", strings.TrimRight(backupConfig.Spec.Storage.S3.ResolvedPrefix, "/"), pgMajorVersion)
+		config.WaleS3Prefix = fmt.Sprintf("%s/%s", strings.TrimRight(backupConfig.Spec.Storage.S3.ResolvedPrefix, "/"), folder)
 		config.WalgS3StorageClass = backupConfig.Spec.Storage.S3.StorageClass
 
 		// Handle custom CA certificate if provided
@@ -149,7 +165,7 @@ func NewConfigFromBackupConfig(backupConfig *v1beta1.BackupConfigWithSecrets, pg
 			}
 		}
 	case v1beta1.StorageTypeGCS:
-		config.WalgGSPrefix = fmt.Sprintf("%s/%d", strings.TrimRight(backupConfig.Spec.Storage.GCS.ResolvedPrefix, "/"), pgMajorVersion)
+		config.WalgGSPrefix = fmt.Sprintf("%s/%s", strings.TrimRight(backupConfig.Spec.Storage.GCS.ResolvedPrefix, "/"), folder)
 
 		if backupConfig.Spec.Storage.GCS.CredentialsData != "" {
 			credentialsFilePath, err := ensureGCSCredentialsFile(

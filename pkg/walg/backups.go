@@ -17,8 +17,10 @@ limitations under the License.
 package walg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"strconv"
@@ -90,10 +92,16 @@ func (m *BackupMetadata) HasMatchingTimeline(targetTimeline string) bool {
 }
 
 // BackupPush runs `wal-g backup-push` for the given PGDATA directory with optional user data.
-func (c *Client) BackupPush(ctx context.Context, pgdata string, userDataJSON string) (*cmd.RunResult, error) {
+// A permanent backup carries the mark in the metadata it uploads first, so it never needs
+// `wal-g backup-mark`, which rewrites metadata.json (refused by an R2 bucket lock).
+func (c *Client) BackupPush(ctx context.Context, pgdata string, userDataJSON string, permanent bool) (*cmd.RunResult, error) {
 	logger := logr.FromContextOrDiscard(ctx)
 
-	result, err := cmd.New("wal-g", "backup-push", pgdata, "--add-user-data", userDataJSON).
+	args := []string{"backup-push", pgdata, "--add-user-data", userDataJSON}
+	if permanent {
+		args = append(args, "--permanent")
+	}
+	result, err := cmd.New("wal-g", args...).
 		WithContext(ctx).
 		WithEnv(c.config.ToEnvMap()).
 		Run()
@@ -219,6 +227,11 @@ func (c *Client) MarkBackupPermanent(ctx context.Context, backupName string) err
 // This is useful when a backup needs to be deleted after being marked permanent.
 // Does nothing and returns no error if the backup is already not marked permanent.
 func (c *Client) UnmarkBackupPermanent(ctx context.Context, backupName string) error {
+	_, err := c.unmarkBackupPermanent(ctx, backupName)
+	return err
+}
+
+func (c *Client) unmarkBackupPermanent(ctx context.Context, backupName string) (*cmd.RunResult, error) {
 	logger := logr.FromContextOrDiscard(ctx)
 
 	result, err := cmd.New("wal-g", "backup-mark", "-i", backupName).
@@ -232,15 +245,19 @@ func (c *Client) UnmarkBackupPermanent(ctx context.Context, backupName string) e
 			"stdout", result.Stdout(), "stderr", result.Stderr(),
 		)
 	}
-	return err
+	return result, err
 }
 
 // DeleteBackup deletes a backup and runs garbage collection using wal-g.
 func (c *Client) DeleteBackup(ctx context.Context, backupName string) (*cmd.RunResult, error) {
 	logger := logr.FromContextOrDiscard(ctx)
 
-	// Ignore errors on UnmarkBackupPermanent and try our best to remove backup
-	_ = c.UnmarkBackupPermanent(ctx, backupName)
+	// Errors on UnmarkBackupPermanent are ignored (try our best to remove the backup),
+	// except a bucket lock refusal: the backup is younger than the lock and cannot go.
+	if unmarkResult, unmarkErr := c.unmarkBackupPermanent(ctx, backupName); unmarkErr != nil &&
+		IsRetainedByLock(unmarkResult.Stderr()) {
+		return unmarkResult, ErrRetainedByLock
+	}
 
 	result, err := cmd.New("wal-g", "delete", "target", backupName, "--confirm").
 		WithContext(ctx).
@@ -251,6 +268,10 @@ func (c *Client) DeleteBackup(ctx context.Context, backupName string) (*cmd.RunR
 	// If backup already not exists in storage - do not treat this as an error, return success
 	if err != nil && strings.Contains(string(result.Stderr()), backupDoesNotExistStr) {
 		err = nil
+	}
+	// wal-g exits 0 when the lock refused the deletes: the backup is still in storage.
+	if IsRetainedByLock(result.Stderr()) {
+		return result, ErrRetainedByLock
 	}
 	// Do not abort if error not-nil and try anyway to perform `wal-g delete garbage` anyway
 
@@ -288,10 +309,27 @@ func (c *Client) DeleteAllBackupsAndWALsInStorage(ctx context.Context) (*cmd.Run
 		}
 	}
 
-	return cmd.New("wal-g", "delete", "everything", "FORCE", "--confirm").
+	result, err := cmd.New("wal-g", "delete", "everything", "FORCE", "--confirm").
 		WithContext(ctx).
 		WithEnv(c.config.ToEnvMap()).
 		Run()
+	if err == nil && IsRetainedByLock(result.Stderr()) {
+		err = ErrRetainedByLock
+	}
+	return result, err
+}
+
+// ErrRetainedByLock: the storage refused to delete or rewrite objects because an R2
+// bucket lock still covers them. Nothing was lost and nothing is broken; the objects
+// can be deleted once they are older than the lock age.
+var ErrRetainedByLock = errors.New("retained by bucket lock")
+
+// IsRetainedByLock reports whether a wal-g run (its stderr) hit a bucket lock: wal-g logs a
+// retained delete as "retained by bucket lock" (and exits 0), and a refused
+// single-object write fails with the R2 error code ObjectLockedByBucketPolicy.
+func IsRetainedByLock(stderr []byte) bool {
+	return bytes.Contains(stderr, []byte("retained by bucket lock")) ||
+		bytes.Contains(stderr, []byte("ObjectLockedByBucketPolicy"))
 }
 
 // GetDependentBackups returns a list of backups that depend on the current backup.

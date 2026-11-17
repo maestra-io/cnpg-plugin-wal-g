@@ -21,38 +21,42 @@ import (
 	"syscall"
 )
 
+// Exit statuses are delivered per pid. The old broadcast (every exit sent to every
+// subscriber over a buffered channel, under the lock) blocked the reaper for good
+// once a subscriber that had stopped reading had 8 undelivered exits, and with it
+// every later wal-g call; more concurrent reconciles made that likelier.
 var (
-	subscribers   map[chan ProcessInfo]bool
-	subscribersMx sync.Mutex
+	waiters   = map[int]chan syscall.WaitStatus{}
+	waitersMx sync.Mutex
 )
 
-func subscribeOnProcessExits(ch chan ProcessInfo) {
-	subscribersMx.Lock()
-	defer subscribersMx.Unlock()
-
-	// Initialize map on first access
-	if subscribers == nil {
-		subscribers = make(map[chan ProcessInfo]bool)
+// startAndAwait runs start (which starts the process and returns its pid) under the
+// lock, so the reaper cannot deliver the pid's exit before its waiter is registered.
+func startAndAwait(start func() (int, error)) (int, <-chan syscall.WaitStatus, error) {
+	waitersMx.Lock()
+	defer waitersMx.Unlock()
+	pid, err := start()
+	if err != nil {
+		return 0, nil, err
 	}
-	subscribers[ch] = true
+	ch := make(chan syscall.WaitStatus, 1)
+	waiters[pid] = ch
+	return pid, ch, nil
 }
 
-func unsubscribeFromProcessExits(ch chan ProcessInfo) {
-	subscribersMx.Lock()
-	defer subscribersMx.Unlock()
-
-	delete(subscribers, ch)
+// stopAwaiting drops the waiter of pid (its caller gave up waiting).
+func stopAwaiting(pid int) {
+	waitersMx.Lock()
+	defer waitersMx.Unlock()
+	delete(waiters, pid)
 }
 
+// notifyAllSubscribers hands the exit status of pid to its waiter, if any. Never blocks.
 func notifyAllSubscribers(pid int, wstatus syscall.WaitStatus) {
-	subscribersMx.Lock()
-	subscribersSafeCopy := make([]chan ProcessInfo, 0, len(subscribers))
-	for subscriber := range subscribers {
-		subscribersSafeCopy = append(subscribersSafeCopy, subscriber)
-	}
-	defer subscribersMx.Unlock()
-
-	for _, subscriber := range subscribersSafeCopy {
-		subscriber <- ProcessInfo{Pid: pid, Status: wstatus}
+	waitersMx.Lock()
+	defer waitersMx.Unlock()
+	if ch, ok := waiters[pid]; ok {
+		delete(waiters, pid)
+		ch <- wstatus
 	}
 }

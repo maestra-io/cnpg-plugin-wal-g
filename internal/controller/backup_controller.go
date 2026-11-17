@@ -37,6 +37,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 )
 
 // BackupReconciler reconciles a Backup object
@@ -51,17 +52,33 @@ type BackupReconciler struct {
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=backups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=backups/finalizers,verbs=update
 
+const (
+	// BackupReconcileTimeout bounds one Backup reconcile, wal-g subprocesses included:
+	// a hung wal-g call (e.g. a storage refusal it keeps retrying) must not hold a worker.
+	BackupReconcileTimeout = 2 * time.Minute
+
+	// BackupReconcileConcurrency is how many Backups are reconciled at once. One worker
+	// served every CNPG cluster of the Kubernetes cluster, so one slow wal-g call stalled
+	// all of them. The reconciler keeps no state of its own: controller-runtime never runs
+	// one Backup twice at once, objects are written with resourceVersion (a conflict
+	// requeues), the deletion controller is mutex-guarded, the wal-g file caches write
+	// atomically and subprocess exits are delivered per pid (internal/util/cmd).
+	BackupReconcileConcurrency = 4
+)
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *BackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cnpgv1.Backup{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: BackupReconcileConcurrency}).
 		Complete(r)
 }
 
 // Reconcile handles Backup resource events
 func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logr.FromContextOrDiscard(ctx)
-	ctx = logr.NewContext(ctx, logger)
+	ctx, cancel := context.WithTimeout(logr.NewContext(ctx, logger), BackupReconcileTimeout)
+	defer cancel()
 
 	logger.V(1).Info("Reconciling backup")
 
@@ -92,7 +109,10 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				RequeueAfter: 3 * time.Minute,
 			}, nil
 		}
-		return ctrl.Result{}, nil
+		// The finalizer stays until the backup is gone from storage. Come back after the
+		// deletion request's own timeout: a deletion refused by a bucket lock or failed is
+		// retried, a finished one finds the Backup gone.
+		return ctrl.Result{RequeueAfter: DeletionRequestTimeout + 2*time.Minute}, nil
 	}
 
 	// Set owner reference to BackupConfig
@@ -235,17 +255,22 @@ func (r *BackupReconciler) reconcileBackupPermanence(ctx context.Context, backup
 		return fmt.Errorf("while getting backupconfig with secrets: %w", err)
 	}
 
-	// Manual backup is a backup not owned by anything except BackupConfig
-	// (for automated backups owner is either Cluster or ScheduledBackup resource)
-	// We assume that all backups passed there are owned by BackupConfig,
-	// so it is enough to check that there's only 1 OwnerReference
-	backupIsManual := len(backup.OwnerReferences) == 1
-	if backupIsManual {
+	if needsBackupMark(backup) {
 		err = walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion).MarkBackupPermanent(ctx, backup.Status.BackupID)
 	}
 
 	// We do NOT unmark backups as inpermanent - it will be done during backup deletion operation
 	return err
+}
+
+// needsBackupMark reports whether a completed Backup still has to be marked permanent with
+// `wal-g backup-mark`: a manual backup (not owned by anything except the BackupConfig; an
+// automated one is owned by its Cluster or ScheduledBackup; the controller has added the
+// BackupConfig owner by now, so there is exactly one OwnerReference) that the sidecar did
+// not push permanent. A sidecar from before the pushed mark leaves pluginMetadata empty.
+func needsBackupMark(backup *cnpgv1.Backup) bool {
+	backupIsManual := len(backup.OwnerReferences) == 1
+	return backupIsManual && backup.Status.PluginMetadata[common.BackupPermanentMetadataKey] != "true"
 }
 
 func (r *BackupReconciler) reconcileRelatedBackupsMetadata(ctx context.Context, backup *cnpgv1.Backup) error {

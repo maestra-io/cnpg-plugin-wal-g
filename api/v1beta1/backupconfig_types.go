@@ -366,3 +366,9 @@ type BackupConfigList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []BackupConfig `json:"items"`
 }
+
+// ConditionTypeBackupDeletionRetainedByLock is present (status True) while the deletion
+// of at least one Backup of this BackupConfig is refused by an R2 bucket lock. It is
+// informational: the backups are intact and their deletion is retried. It is removed
+// when no deletion is retained.
+const ConditionTypeBackupDeletionRetainedByLock = "BackupDeletionRetainedByLock"

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -216,7 +217,12 @@ func (b *BackupDeletionController) processDeletionQueue(
 				err = fmt.Errorf("unknown resource type: %s", request.Type)
 			}
 
-			if err != nil {
+			switch {
+			case errors.Is(err, walg.ErrRetainedByLock):
+				// Not a failure: storage keeps the backup until it is older than the lock age.
+				logger.Info("Deletion refused by the bucket lock, the resource keeps its finalizer and is retried",
+					"type", request.Type, "key", request.Key)
+			case err != nil:
 				logger.Error(err, "Failed to process deletion request", "type", request.Type, "key", request.Key)
 			}
 		}
@@ -236,7 +242,8 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	backup := &cnpgv1.Backup{}
 	err = b.Get(ctx, backupKey, backup)
 	if err != nil {
-		return fmt.Errorf("while getting backup %v: %w", backupKey, err)
+		// NotFound: an earlier request of a requeued deletion already finished it
+		return client.IgnoreNotFound(err)
 	}
 
 	if backup.Labels == nil || backup.Annotations == nil {
@@ -301,6 +308,14 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	// Delete the backup using WAL-G
 	logger.Info("Deleting backup from storage via WAL-G", "backupID", backup.Status.BackupID)
 	result, err := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion).DeleteBackup(ctx, backup.Status.BackupID)
+	if errors.Is(err, walg.ErrRetainedByLock) {
+		// Do not claim a deletion that did not happen: the finalizer stays, the Backup is
+		// marked, and the BackupConfig status counts it (status controller).
+		if markErr := markBackupRetainedByLock(ctx, b.Client, backup, time.Now()); markErr != nil {
+			return fmt.Errorf("while marking backup %v retained by bucket lock: %w", backupKey, markErr)
+		}
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf(
 			"while wal-g backup removal: error %w\nWAL-G stdout: %s\nWAL-G stderr: %s",
@@ -311,6 +326,19 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	}
 
 	return removeBackupFinalizer(ctx, backup, b.Client)
+}
+
+// markBackupRetainedByLock sets BackupRetainedByLockAnnotationName (first refusal time) once.
+func markBackupRetainedByLock(ctx context.Context, c client.Client, backup *cnpgv1.Backup, now time.Time) error {
+	if _, ok := backup.Annotations[v1beta1.BackupRetainedByLockAnnotationName]; ok {
+		return nil
+	}
+	patch := client.MergeFrom(backup.DeepCopy())
+	if backup.Annotations == nil {
+		backup.Annotations = map[string]string{}
+	}
+	backup.Annotations[v1beta1.BackupRetainedByLockAnnotationName] = now.UTC().Format(time.RFC3339)
+	return c.Patch(ctx, backup, patch)
 }
 
 func removeBackupFinalizer(ctx context.Context, backup *cnpgv1.Backup, client client.Client) error {
