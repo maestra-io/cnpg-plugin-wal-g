@@ -17,6 +17,7 @@ limitations under the License.
 package common
 
 import (
+	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/cloudnative-pg/cnpg-i/pkg/identity"
 	"github.com/wal-g/cnpg-plugin-wal-g/pkg/version"
 )
@@ -50,3 +51,19 @@ const InstancePluginSocketPath = "/plugins/" + PluginNameDeprecated
 
 // PluginBinaryPath is where the image installs the plugin binary (Dockerfile).
 const PluginBinaryPath = "/usr/local/bin/cnpg-plugin-wal-g"
+
+// BackupPermanentMetadataKey in Backup.status.pluginMetadata is "true" when the sidecar
+// pushed the backup with the permanent mark already in its metadata.
+const BackupPermanentMetadataKey = "walgPermanent"
+
+// IsManualBackup reports whether a user created the Backup directly: it has no owner but
+// the BackupConfig (the plugin's controller adds that one). Scheduled and post-deploy
+// Backups are owned by their ScheduledBackup or Cluster.
+func IsManualBackup(backup *cnpgv1.Backup) bool {
+	for _, ref := range backup.OwnerReferences {
+		if ref.Kind != "BackupConfig" {
+			return false
+		}
+	}
+	return true
+}

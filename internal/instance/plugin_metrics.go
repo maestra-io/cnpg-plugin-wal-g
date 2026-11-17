@@ -53,6 +53,7 @@ var (
 	totalBackupsS3UsageBytesMetricName     = buildFqName("total_backups_s3_usage_bytes")
 	s3ReadAvailabilityMetricName           = buildFqName("s3_read_availability")
 	s3WriteAvailabilityMetricName          = buildFqName("s3_write_availability")
+	backupDeletionRetainedByLockMetricName = buildFqName("backup_deletion_retained_by_lock")
 )
 
 func (m MetricsServerImplementation) GetCapabilities(
@@ -118,6 +119,12 @@ func (m MetricsServerImplementation) Define(
 				Help:      "Remote object storage write availability (0 meaning false, 1 - true)",
 				ValueType: &metrics.MetricType{Type: metrics.MetricType_TYPE_GAUGE},
 			},
+			{
+				FqName: backupDeletionRetainedByLockMetricName,
+				Help: "1 while the deletion of at least one Backup is refused by the R2 bucket lock " +
+					"(the backup stays in storage, the deletion is retried), 0 otherwise",
+				ValueType: &metrics.MetricType{Type: metrics.MetricType_TYPE_GAUGE},
+			},
 		},
 	}, nil
 }
@@ -180,8 +187,17 @@ func (m MetricsServerImplementation) Collect(
 		}
 	}
 
+	var backupDeletionRetainedByLock float64
+	if meta.IsStatusConditionTrue(backupConfig.Status.Conditions, v1beta1.ConditionTypeBackupDeletionRetainedByLock) {
+		backupDeletionRetainedByLock = 1
+	}
+
 	return &metrics.CollectMetricsResult{
 		Metrics: []*metrics.CollectMetric{
+			{
+				FqName: backupDeletionRetainedByLockMetricName,
+				Value:  backupDeletionRetainedByLock,
+			},
 			{
 				FqName: firstRecoverabilityPointMetricName,
 				Value:  firstRecoverabilityPointTS,

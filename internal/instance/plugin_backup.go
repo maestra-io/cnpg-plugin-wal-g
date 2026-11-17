@@ -154,7 +154,11 @@ func (b BackupServiceImplementation) Backup(
 		return nil, fmt.Errorf("there are backups with later LSN, this usually means that we are creating backup with a very outdated replica")
 	}
 
-	result, err := walgClient.BackupPush(logr.NewContext(ctx, logger), pgdata, string(backupParamsJSON))
+	// A manual Backup (no owner but the BackupConfig; the controller adds that one) is
+	// kept permanent. The mark goes into the first upload of its metadata: marking it
+	// afterwards rewrites metadata.json, which an R2 bucket lock refuses.
+	result, err := walgClient.BackupPush(logr.NewContext(ctx, logger), pgdata, string(backupParamsJSON),
+		common.IsManualBackup(backup))
 
 	if err != nil {
 		logger.Error(err, "Error on wal-g backup-push", "stdout", string(result.Stdout()), "stderr", string(result.Stderr()))
@@ -210,6 +214,7 @@ func (b BackupServiceImplementation) buildBackupResult(
 	}
 
 	return &cnpgbackup.BackupResult{
+		Metadata:   backupResultMetadata(currentBackupMetadata),
 		BackupId:   currentBackupMetadata.BackupName,
 		BackupName: backupHumanName,
 		StartedAt:  backupStartTime.Unix(),
@@ -269,4 +274,13 @@ func (b BackupServiceImplementation) getCurrentLSNAndSystemID(ctx context.Contex
 	}
 
 	return lsn, int(systemID), nil
+}
+
+// backupResultMetadata becomes Backup.status.pluginMetadata: it tells the controller that
+// the backup was pushed permanent, so it never runs `wal-g backup-mark` on it.
+func backupResultMetadata(backup *walg.BackupMetadata) map[string]string {
+	if !backup.IsPermanent {
+		return nil
+	}
+	return map[string]string{common.BackupPermanentMetadataKey: "true"}
 }

@@ -17,6 +17,9 @@ limitations under the License.
 package common
 
 import (
+	"regexp"
+	"strings"
+
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -88,4 +91,31 @@ func GetInitContainerRestartPolicy(cluster *cnpgv1.Cluster) *corev1.ContainerRes
 		policy := corev1.ContainerRestartPolicyAlways
 		return &policy
 	}
+}
+
+// SidecarImageTagParameter selects, for one Cluster, another tag of the sidecar
+// image than --cnpg-i-pg-sidecar-image carries (a canary of a new sidecar on one
+// Cluster, without rolling every instance pod of the Kubernetes cluster). Only
+// the tag can change: the repository stays the operator's.
+const SidecarImageTagParameter = "sidecarImageTag"
+
+var sidecarImageTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`)
+
+// GetSidecarImage returns the sidecar image for cluster: defaultImage, or its
+// repository with the tag from the sidecarImageTag parameter when that is a
+// valid release tag (vX.Y.Z[-suffix]). An invalid tag falls back to defaultImage.
+func GetSidecarImage(cluster *cnpgv1.Cluster, defaultImage string) string {
+	pluginConfig := GetPluginConfigFromCluster(cluster)
+	if pluginConfig == nil {
+		return defaultImage
+	}
+	tag, ok := pluginConfig.Parameters[SidecarImageTagParameter]
+	if !ok || !sidecarImageTagPattern.MatchString(tag) {
+		return defaultImage
+	}
+	repository := strings.SplitN(defaultImage, "@", 2)[0]
+	if i := strings.LastIndex(repository, ":"); i > strings.LastIndex(repository, "/") {
+		repository = repository[:i]
+	}
+	return repository + ":" + tag
 }

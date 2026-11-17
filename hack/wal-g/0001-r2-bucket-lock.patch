@@ -1,0 +1,499 @@
+From f267386612ff01c82c5512ffc9eba7ed58dab9f2 Mon Sep 17 00:00:00 2001
+From: Igor Kudrin <clain@clain23.ru>
+Date: Tue, 17 Nov 2026 20:29:20 +0000
+Subject: [PATCH] s3: treat an R2 bucket lock refusal as final, read
+ DeleteObjects per-key errors
+
+- retryer: a 409 with code ObjectLockedByBucketPolicy is not retried (other
+  409s are, as before); S3_MAX_RETRIES=15 with a 300 s cap retried it ~40 min.
+- DeleteObjects reads the per-key error list of the 200 answer: a key the lock
+  retains becomes storage.ObjectsRetainedError, any other per-key error fails.
+- delete: retained objects are logged as "retained by bucket lock, not
+  deleted" and the command exits 0 without "Objects deleted successfully".
+- wal-push: an upload refused by the lock compares the stored segment; equal
+  content is archived already (exit 0), different content fails at once.
+
+Refs maestra-io/issues-maestra#1786
+---
+ .../databases/postgres/wal_push_handler.go    | 23 +++++
+ .../databases/postgres/wal_push_lock_test.go  | 84 +++++++++++++++++++
+ internal/delete_handler.go                    |  9 ++
+ internal/delete_handler_lock_test.go          | 37 ++++++++
+ internal/multistorage/folder.go               | 19 +++--
+ internal/storagetools/check.go                |  4 +-
+ pkg/storages/s3/folder.go                     | 23 ++++-
+ pkg/storages/s3/folder_delete_test.go         | 75 +++++++++++++++++
+ pkg/storages/s3/retryer.go                    |  5 ++
+ pkg/storages/s3/retryer_test.go               | 15 ++++
+ pkg/storages/storage/errors.go                | 23 +++++
+ 11 files changed, 309 insertions(+), 8 deletions(-)
+ create mode 100644 internal/databases/postgres/wal_push_lock_test.go
+ create mode 100644 internal/delete_handler_lock_test.go
+ create mode 100644 pkg/storages/s3/folder_delete_test.go
+
+diff --git a/internal/databases/postgres/wal_push_handler.go b/internal/databases/postgres/wal_push_handler.go
+index 41fc55cb..cab15909 100644
+--- a/internal/databases/postgres/wal_push_handler.go
++++ b/internal/databases/postgres/wal_push_handler.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/wal-g/wal-g/internal"
+ 	conf "github.com/wal-g/wal-g/internal/config"
+ 	"github.com/wal-g/wal-g/internal/statistics"
++	"github.com/wal-g/wal-g/pkg/storages/storage"
+ )
+ 
+ type CantOverwriteWalFileError struct {
+@@ -101,12 +102,34 @@ func uploadWALFile(ctx context.Context, uploader *WalUploader, walFilePath strin
+ 		}
+ 	}()
+ 	err = uploader.UploadWalFile(ctx, walFile)
++	if err != nil && storage.IsObjectLockedError(err) {
++		return handleLockedWALUpload(ctx, uploader, walFilePath, err)
++	}
+ 	if err != nil {
+ 		return errors.Wrapf(err, "upload: could not Upload '%s'\n", walFilePath)
+ 	}
+ 	return nil
+ }
+ 
++// handleLockedWALUpload runs when a bucket lock refused the upload: the segment is
++// already in storage and younger than the lock age (a concurrent push won the
++// race, or a retry after a lost response). Equal content is archived already;
++// different content cannot be fixed by retrying until the lock age passes.
++func handleLockedWALUpload(ctx context.Context, uploader *WalUploader, walFilePath string, uploadErr error) error {
++	overwriteAttempt, err := checkWALOverwrite(ctx, uploader, walFilePath)
++	switch {
++	case overwriteAttempt && err == nil:
++		return nil
++	case overwriteAttempt:
++		return errors.Wrapf(err, "upload of '%s' refused by bucket lock", walFilePath)
++	case err != nil:
++		return errors.Wrapf(err, "upload of '%s' refused by bucket lock (%v), and the stored segment could not be compared",
++			walFilePath, uploadErr)
++	default:
++		return errors.Wrapf(uploadErr, "upload of '%s' refused by bucket lock, but no stored segment was found", walFilePath)
++	}
++}
++
+ // TODO : unit tests
+ func checkWALOverwrite(ctx context.Context, uploader *WalUploader, walFilePath string) (overwriteAttempt bool, err error) {
+ 	walFileReader, err := internal.DownloadAndDecompressStorageFile(ctx,
+diff --git a/internal/databases/postgres/wal_push_lock_test.go b/internal/databases/postgres/wal_push_lock_test.go
+new file mode 100644
+index 00000000..971ad349
+--- /dev/null
++++ b/internal/databases/postgres/wal_push_lock_test.go
+@@ -0,0 +1,84 @@
++package postgres_test
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/aws/smithy-go"
++	"github.com/spf13/viper"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/wal-g/wal-g/internal"
++	"github.com/wal-g/wal-g/internal/asm"
++	"github.com/wal-g/wal-g/internal/compression"
++	conf "github.com/wal-g/wal-g/internal/config"
++	"github.com/wal-g/wal-g/internal/databases/postgres"
++	"github.com/wal-g/wal-g/pkg/storages/memory"
++	"github.com/wal-g/wal-g/pkg/storages/storage"
++	"github.com/wal-g/wal-g/testtools"
++)
++
++// lockedFolder refuses every upload the way an R2 bucket lock refuses an
++// overwrite of an object younger than the lock age.
++type lockedFolder struct {
++	*memory.Folder
++}
++
++func (f lockedFolder) PutObject(_ context.Context, name string, _ io.Reader) error {
++	return fmt.Errorf("failed to upload '%s': %w", name, &smithy.GenericAPIError{
++		Code:    storage.ObjectLockedErrorCode,
++		Message: "Object is locked by bucket policy",
++	})
++}
++
++// pushUnderLock archives one segment with content local while storage holds
++// stored (nil: nothing stored) and every upload is refused by the lock.
++func pushUnderLock(t *testing.T, local, stored []byte) error {
++	viper.Set(conf.PreventWalOverwriteSetting, false) // the lock path must not depend on the pre-check
++	t.Cleanup(func() { viper.Set(conf.PreventWalOverwriteSetting, false) })
++
++	dir, _ := setupArchiveStatus(t, "")
++	t.Cleanup(func() { testtools.Cleanup(t, dir) })
++	walDir := filepath.Join(dir, "pg_wal")
++	name := testFilename("1")
++	addTestDataFile(t, walDir, "1")
++	require.NoError(t, os.WriteFile(filepath.Join(walDir, name), local, 0600))
++	viper.Set(conf.PgDataSetting, dir)
++
++	folder := memory.NewFolder("in_memory/", memory.NewKVS())
++	compressor := compression.Compressors["lz4"]
++	if stored != nil {
++		storedPath := filepath.Join(t.TempDir(), name)
++		require.NoError(t, os.WriteFile(storedPath, stored, 0600))
++		f, err := os.Open(storedPath)
++		require.NoError(t, err)
++		defer f.Close()
++		plain := postgres.NewWalUploader(internal.NewRegularUploader(compressor, folder), nil)
++		require.NoError(t, plain.UploadWalFile(t.Context(), f))
++	}
++
++	uploader := postgres.NewWalUploader(internal.NewRegularUploader(compressor, lockedFolder{folder}), nil)
++	uploader.ArchiveStatusManager = asm.NewFakeASM()
++	return postgres.HandleWALPush(t.Context(), uploader, filepath.Join(walDir, name))
++}
++
++func TestWalPushUnderLock_EqualContentIsArchived(t *testing.T) {
++	assert.NoError(t, pushUnderLock(t, []byte("segment"), []byte("segment")))
++}
++
++func TestWalPushUnderLock_DifferentContentFailsFast(t *testing.T) {
++	err := pushUnderLock(t, []byte("segment"), []byte("another segment"))
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "refused by bucket lock")
++	assert.Contains(t, err.Error(), "contents differ")
++}
++
++func TestWalPushUnderLock_NothingStoredFails(t *testing.T) {
++	err := pushUnderLock(t, []byte("segment"), nil)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "refused by bucket lock, but no stored segment was found")
++}
+diff --git a/internal/delete_handler.go b/internal/delete_handler.go
+index 5cbaf990..695be63b 100644
+--- a/internal/delete_handler.go
++++ b/internal/delete_handler.go
+@@ -516,6 +516,15 @@ func DeleteObjectsWhere(
+ 		if err == nil {
+ 			tracelog.InfoLogger.Printf("Objects deleted successfully: count=%d\n", deletionCount)
+ 		}
++		// A bucket lock refusal is not a failure: the objects stay until they are
++		// older than the lock age and a later run deletes them. Exit 0, but never
++		// claim they were deleted.
++		var retained storage.ObjectsRetainedError
++		if errors.As(err, &retained) {
++			tracelog.WarningLogger.Printf("Objects retained by bucket lock, not deleted: count=%d of %d\n",
++				len(retained.Keys), deletionCount)
++			return nil
++		}
+ 		return err
+ 	}
+ 	tracelog.InfoLogger.Printf("Dry run: objects would be deleted count=%d, Run with --confirm to execute\n", deletionCount)
+diff --git a/internal/delete_handler_lock_test.go b/internal/delete_handler_lock_test.go
+new file mode 100644
+index 00000000..7981dbe6
+--- /dev/null
++++ b/internal/delete_handler_lock_test.go
+@@ -0,0 +1,37 @@
++package internal
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/wal-g/wal-g/pkg/storages/storage"
++)
++
++// retainingFolder answers every delete the way an R2 bucket lock does.
++type retainingFolder struct {
++	storage.Folder
++}
++
++func (f retainingFolder) DeleteObjects(_ context.Context, objects []storage.Object) error {
++	keys := make([]string, 0, len(objects))
++	for _, o := range objects {
++		keys = append(keys, o.GetName())
++	}
++	return storage.ObjectsRetainedError{Keys: keys}
++}
++
++func (f retainingFolder) GetSubFolder(path string) storage.Folder {
++	return retainingFolder{f.Folder.GetSubFolder(path)}
++}
++
++func TestDeleteObjectsWhere_RetainedByLockIsNotAFailure(t *testing.T) {
++	folder := retainingFolder{CreateMockStorageFolder(t.Context())}
++	err := DeleteObjectsWhere(t.Context(), folder, true,
++		func(storage.Object) bool { return true }, func(string) bool { return true })
++	assert.NoError(t, err)
++	// nothing was deleted
++	objects, _, err := folder.GetSubFolder("basebackups_005/").ListFolder(t.Context())
++	assert.NoError(t, err)
++	assert.NotEmpty(t, objects)
++}
+diff --git a/internal/multistorage/folder.go b/internal/multistorage/folder.go
+index b2c7de04..d2f289df 100644
+--- a/internal/multistorage/folder.go
++++ b/internal/multistorage/folder.go
+@@ -649,26 +649,35 @@ func (mf Folder) DeleteObjectsFromFirst(ctx context.Context, objectRelativePaths
+ 	first := mf.usedFolders[0]
+ 	filesNum := len(objectRelativePaths)
+ 	err := first.DeleteObjects(ctx, objectRelativePaths)
++	// Objects retained by a bucket lock are a storage answer, not a storage failure.
++	mf.statsCollector.ReportOperationResult(first.StorageName, stats.OperationDelete(filesNum), err == nil || isRetained(err))
+ 	if err != nil {
+-		mf.statsCollector.ReportOperationResult(first.StorageName, stats.OperationDelete(filesNum), false)
+ 		return fmt.Errorf("delete object from storage %q: %w", first.StorageName, err)
+ 	}
+-	mf.statsCollector.ReportOperationResult(first.StorageName, stats.OperationDelete(filesNum), true)
+ 	return nil
+ }
+ 
++func isRetained(err error) bool {
++	var retained storage.ObjectsRetainedError
++	return errors.As(err, &retained)
++}
++
+ // DeleteObjectsFromAll deletes the objects from all used storages.
+ func (mf Folder) DeleteObjectsFromAll(ctx context.Context, objectRelativePaths []storage.Object) error {
+ 	filesNum := len(objectRelativePaths)
++	var retainedErr error
+ 	for _, f := range mf.usedFolders {
+ 		err := f.DeleteObjects(ctx, objectRelativePaths)
++		mf.statsCollector.ReportOperationResult(f.StorageName, stats.OperationDelete(filesNum), err == nil || isRetained(err))
++		if isRetained(err) {
++			retainedErr = fmt.Errorf("delete objects from storage %q: %w", f.StorageName, err)
++			continue
++		}
+ 		if err != nil {
+-			mf.statsCollector.ReportOperationResult(f.StorageName, stats.OperationDelete(filesNum), false)
+ 			return fmt.Errorf("delete objects from storage %q: %w", f.StorageName, err)
+ 		}
+-		mf.statsCollector.ReportOperationResult(f.StorageName, stats.OperationDelete(filesNum), true)
+ 	}
+-	return nil
++	return retainedErr
+ }
+ 
+ // CopyObject copies the object in multiple storages. A specific implementation is selected using policies.Policies
+diff --git a/internal/storagetools/check.go b/internal/storagetools/check.go
+index b5900a69..edafb258 100644
+--- a/internal/storagetools/check.go
++++ b/internal/storagetools/check.go
+@@ -51,8 +51,8 @@ func HandleCheckWrite(ctx context.Context, folder storage.Folder) error {
+ 		}
+ 	}
+ 	err := folder.PutObject(ctx, filename, bytes.NewBufferString("test"))
+-	if folder.DeleteObjects(ctx, []storage.Object{storage.NewLocalObject(filename, time.Time{}, 0)}) != nil {
+-		tracelog.WarningLogger.Printf("failed to clean temp files, %s left in storage", filename)
++	if delErr := folder.DeleteObjects(ctx, []storage.Object{storage.NewLocalObject(filename, time.Time{}, 0)}); delErr != nil {
++		tracelog.WarningLogger.Printf("failed to clean temp files, %s left in storage: %v", filename, delErr)
+ 	}
+ 	if err != nil {
+ 		return fmt.Errorf("failed to write to the storage: %v", err)
+diff --git a/pkg/storages/s3/folder.go b/pkg/storages/s3/folder.go
+index 1126c13d..9823ddbd 100644
+--- a/pkg/storages/s3/folder.go
++++ b/pkg/storages/s3/folder.go
+@@ -479,8 +479,13 @@ func (folder *Folder) listObjectsPages(ctx context.Context, prefix *string, deli
+ 	return nil
+ }
+ 
++// DeleteObjects deletes objects in batches. S3 answers DeleteObjects with HTTP 200
++// and a per-key error list, so a refused key is read from the response: a key a
++// bucket lock still retains is reported as storage.ObjectsRetainedError (the rest
++// of the batch is deleted), any other per-key error fails the call.
+ func (folder *Folder) DeleteObjects(ctx context.Context, objects []storage.Object) error {
+ 	parts := partitionObjects(objects, folder.config.DeleteBatchSize)
++	var retained []string
+ 
+ 	for _, part := range parts {
+ 		tracelog.DebugLogger.Printf("len of part  %d", len(part))
+@@ -497,13 +502,29 @@ func (folder *Folder) DeleteObjects(ctx context.Context, objects []storage.Objec
+ 			}
+ 			input.Delete.Objects = append(input.Delete.Objects, objectIdentifier)
+ 		}
+-		_, err := folder.s3API.DeleteObjects(ctx, input, withContentMD5)
++		out, err := folder.s3API.DeleteObjects(ctx, input, withContentMD5)
+ 		if err != nil {
+ 			for _, obj := range part {
+ 				tracelog.DebugLogger.Printf("object %s version %s", obj.GetName(), obj.GetVersionID())
+ 			}
+ 			return errors.Wrapf(err, "failed to delete s3 object: '%s'", part)
+ 		}
++		var failed []string
++		for _, keyErr := range out.Errors {
++			key := aws.ToString(keyErr.Key)
++			if aws.ToString(keyErr.Code) == storage.ObjectLockedErrorCode {
++				tracelog.WarningLogger.Printf("object %s retained by bucket lock, not deleted", key)
++				retained = append(retained, key)
++				continue
++			}
++			failed = append(failed, fmt.Sprintf("%s (%s: %s)", key, aws.ToString(keyErr.Code), aws.ToString(keyErr.Message)))
++		}
++		if len(failed) > 0 {
++			return fmt.Errorf("failed to delete %d of %d s3 object(s): %s", len(failed), len(part), strings.Join(failed, ", "))
++		}
++	}
++	if len(retained) > 0 {
++		return storage.ObjectsRetainedError{Keys: retained}
+ 	}
+ 	return nil
+ }
+diff --git a/pkg/storages/s3/folder_delete_test.go b/pkg/storages/s3/folder_delete_test.go
+new file mode 100644
+index 00000000..54e71e41
+--- /dev/null
++++ b/pkg/storages/s3/folder_delete_test.go
+@@ -0,0 +1,75 @@
++package s3_test
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/service/s3"
++	"github.com/aws/aws-sdk-go-v2/service/s3/types"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	walgs3 "github.com/wal-g/wal-g/pkg/storages/s3"
++	"github.com/wal-g/wal-g/pkg/storages/storage"
++)
++
++// mockS3ClientDeleteErrors answers DeleteObjects with HTTP 200 and the given
++// per-key errors, the way R2 answers a delete refused by a bucket lock.
++type mockS3ClientDeleteErrors struct {
++	mockS3ClientVersioning
++	keyErrors map[string]string // key -> error code
++	calls     int
++}
++
++func (m *mockS3ClientDeleteErrors) DeleteObjects(_ context.Context, in *s3.DeleteObjectsInput,
++	_ ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
++	m.calls++
++	out := &s3.DeleteObjectsOutput{}
++	for _, obj := range in.Delete.Objects {
++		if code, ok := m.keyErrors[aws.ToString(obj.Key)]; ok {
++			out.Errors = append(out.Errors, types.Error{Key: obj.Key, Code: aws.String(code), Message: aws.String(code)})
++			continue
++		}
++		out.Deleted = append(out.Deleted, types.DeletedObject{Key: obj.Key})
++	}
++	return out, nil
++}
++
++func deleteWith(t *testing.T, keyErrors map[string]string, names ...string) (error, int) {
++	client := &mockS3ClientDeleteErrors{keyErrors: keyErrors}
++	folder := walgs3.NewFolder(client, nil, "prefix/", &walgs3.Config{Bucket: "b", DeleteBatchSize: 2})
++	objects := make([]storage.Object, 0, len(names))
++	for _, n := range names {
++		objects = append(objects, storage.NewLocalObject(n, time.Time{}, 0))
++	}
++	return folder.DeleteObjects(t.Context(), objects), client.calls
++}
++
++func TestDeleteObjects_AllDeleted(t *testing.T) {
++	err, _ := deleteWith(t, nil, "a", "b", "c")
++	assert.NoError(t, err)
++}
++
++func TestDeleteObjects_LockedKeysAreRetainedNotDeleted(t *testing.T) {
++	err, calls := deleteWith(t, map[string]string{
++		"prefix/a": storage.ObjectLockedErrorCode,
++		"prefix/c": storage.ObjectLockedErrorCode,
++	}, "a", "b", "c")
++	var retained storage.ObjectsRetainedError
++	require.True(t, errors.As(err, &retained), "got %v", err)
++	assert.Equal(t, []string{"prefix/a", "prefix/c"}, retained.Keys)
++	assert.Equal(t, 2, calls, "a retained key must not stop the next batch")
++}
++
++func TestDeleteObjects_OtherKeyErrorFails(t *testing.T) {
++	err, _ := deleteWith(t, map[string]string{
++		"prefix/a": storage.ObjectLockedErrorCode,
++		"prefix/b": "AccessDenied",
++	}, "a", "b")
++	require.Error(t, err)
++	var retained storage.ObjectsRetainedError
++	assert.False(t, errors.As(err, &retained))
++	assert.Contains(t, err.Error(), "prefix/b (AccessDenied")
++}
+diff --git a/pkg/storages/s3/retryer.go b/pkg/storages/s3/retryer.go
+index 09785236..816d2d53 100644
+--- a/pkg/storages/s3/retryer.go
++++ b/pkg/storages/s3/retryer.go
+@@ -104,6 +104,11 @@ func (walgRetryables) IsErrorRetryable(err error) aws.Ternary {
+ 				return aws.TrueTernary
+ 			}
+ 		case 409:
++			// A bucket lock refusal stays until the object is older than the
++			// lock age (days): retrying only delays the caller.
++			if storage.IsObjectLockedError(respErr) {
++				return aws.FalseTernary
++			}
+ 			return aws.TrueTernary
+ 		case 429:
+ 			return aws.TrueTernary
+diff --git a/pkg/storages/s3/retryer_test.go b/pkg/storages/s3/retryer_test.go
+index 333551ab..823d47e0 100644
+--- a/pkg/storages/s3/retryer_test.go
++++ b/pkg/storages/s3/retryer_test.go
+@@ -422,3 +422,18 @@ func s3ResponseError(status int, err error) *smithyhttp.ResponseError {
+ 		Err:      err,
+ 	}
+ }
++
++func TestWalgRetryablesBucketLockIsFinal(t *testing.T) {
++	locked := s3ResponseError(409, &smithy.GenericAPIError{
++		Code:    "ObjectLockedByBucketPolicy",
++		Message: "Object is locked by bucket policy",
++	})
++	assert.Equal(t, aws.FalseTernary, walgRetryables{}.IsErrorRetryable(locked))
++	// the composed retryer agrees, so the SDK returns the refusal at once
++	assert.False(t, newRetryerFunc(&Config{MaxRetries: 15})().IsErrorRetryable(locked))
++
++	// other 409s keep the old behaviour
++	conflict := s3ResponseError(409, &smithy.GenericAPIError{Code: "OperationAborted"})
++	assert.Equal(t, aws.TrueTernary, walgRetryables{}.IsErrorRetryable(conflict))
++	assert.True(t, newRetryerFunc(&Config{MaxRetries: 15})().IsErrorRetryable(conflict))
++}
+diff --git a/pkg/storages/storage/errors.go b/pkg/storages/storage/errors.go
+index 886179dd..82ceed39 100644
+--- a/pkg/storages/storage/errors.go
++++ b/pkg/storages/storage/errors.go
+@@ -26,6 +26,29 @@ func IsTransientIOError(err error) bool {
+ 	return errors.As(err, &networkError) && networkError.Timeout()
+ }
+ 
++// ObjectLockedErrorCode is the error code Cloudflare R2 returns (HTTP 409 for a
++// single-object request, a per-key error of DeleteObjects) when a bucket lock rule
++// still covers the object: it can be neither deleted nor overwritten until it is
++// older than the rule's age.
++const ObjectLockedErrorCode = "ObjectLockedByBucketPolicy"
++
++// IsObjectLockedError reports whether err carries the bucket lock refusal code.
++func IsObjectLockedError(err error) bool {
++	var apiErr interface{ ErrorCode() string }
++	return errors.As(err, &apiErr) && apiErr.ErrorCode() == ObjectLockedErrorCode
++}
++
++// ObjectsRetainedError is returned by DeleteObjects when the storage refused to
++// delete some objects because a bucket lock still retains them, and nothing else
++// failed. The other objects of the request were deleted.
++type ObjectsRetainedError struct {
++	Keys []string
++}
++
++func (err ObjectsRetainedError) Error() string {
++	return fmt.Sprintf("%d object(s) retained by bucket lock, not deleted", len(err.Keys))
++}
++
+ type ObjectNotFoundError struct {
+ 	error
+ }
+-- 
+2.54.0 (Apple Git-157)
+

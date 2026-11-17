@@ -27,11 +27,6 @@ import (
 	"github.com/go-logr/logr"
 )
 
-type ProcessInfo struct {
-	Pid    int
-	Status syscall.WaitStatus
-}
-
 type ZombieProcessReaper struct {
 }
 

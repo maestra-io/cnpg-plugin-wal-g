@@ -45,7 +45,24 @@ func ensureCachedFile(cacheMap map[string]string, mu *sync.RWMutex, filePath, ca
 		return "", fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(filePath, []byte(data), 0644); err != nil {
+	// Write a temp file and rename it over filePath: a wal-g run started by another
+	// reconcile at the same time reads the old or the new file, never a truncated one.
+	tmp, err := os.CreateTemp(dir, filepath.Base(filePath)+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file for %s: %w", filePath, err)
+	}
+	_, err = tmp.WriteString(data)
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Chmod(tmp.Name(), 0644)
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), filePath)
+	}
+	if err != nil {
+		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("failed to write file %s: %w", filePath, err)
 	}
 
