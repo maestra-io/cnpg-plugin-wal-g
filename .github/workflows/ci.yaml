@@ -10,12 +10,15 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # setup-*-nora: the toolchain from nora
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: maestra-io/github-actions/setup-go-nora@f40b5191253ae7e28c10836989a77255666141e4 # v1.104.0
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -31,12 +34,15 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # setup-*-nora: the toolchain from nora
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: maestra-io/github-actions/setup-go-nora@f40b5191253ae7e28c10836989a77255666141e4 # v1.104.0
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -57,7 +63,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: maestra-io/github-actions/setup-go-nora@f40b5191253ae7e28c10836989a77255666141e4 # v1.104.0
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -81,12 +87,15 @@ jobs:
   helm-lint:
     name: Helm Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # setup-*-nora: the toolchain from nora
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Helm
-        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        uses: maestra-io/github-actions/setup-helm-nora@f40b5191253ae7e28c10836989a77255666141e4 # v1.104.0
         with:
           version: 'latest'
 
