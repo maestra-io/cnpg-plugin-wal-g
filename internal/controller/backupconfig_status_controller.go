@@ -284,12 +284,17 @@ func (c *BackupConfigStatusController) reconcileStatusByKey(
 	// Check storage writability
 	c.checkStorageWritable(ctx, backupConfig, walgClient, logger)
 
+	// Timestamps and the deletion conditions (BackupDeletionRetainedByLock,
+	// BackupDeletionFailing) come from the Backup resources alone: they must stay current
+	// while the storage is unreachable, which is when a deletion fails.
+	c.reconcileBackupTimestamps(ctx, backupConfig, logger)
+
 	if readable {
 		// Check WAL integrity and reconcile WAL-related status fields via wal-g wal-show
 		c.reconcileWALStatus(ctx, backupConfig, backupConfigWithSecrets, logger)
 
-		// Reconcile backup-related status fields from wal-g backup-list and CNPG Backup resources
-		c.reconcileBackupFields(ctx, backupConfig, backupConfigWithSecrets, logger)
+		// Reconcile consumed storage from wal-g backup-list across all known PG versions
+		c.reconcileConsumedStorage(ctx, backupConfig, backupConfigWithSecrets, logger)
 	}
 
 	// Determine overall phase from conditions
@@ -565,22 +570,6 @@ func walSegmentPosition(name string) (uint64, bool) {
 		return 0, false
 	}
 	return logID<<32 | seg, true
-}
-
-// reconcileBackupFields reconciles backup-related status fields by fetching backup metadata
-// from wal-g backup-list (for storage size via CompressedSize) and from CNPG Backup resources
-// (for last successful/failed backup timestamps and first recoverability point)
-func (c *BackupConfigStatusController) reconcileBackupFields(
-	ctx context.Context,
-	backupConfig *v1beta1.BackupConfig,
-	backupConfigWithSecrets *v1beta1.BackupConfigWithSecrets,
-	logger logr.Logger,
-) {
-	// Reconcile timestamps from CNPG Backup resources
-	c.reconcileBackupTimestamps(ctx, backupConfig, logger)
-
-	// Reconcile consumed storage from wal-g backup-list across all known PG versions
-	c.reconcileConsumedStorage(ctx, backupConfig, backupConfigWithSecrets, logger)
 }
 
 // reconcileBackupTimestamps reconciles timestamp-related status fields from CNPG Backup resources
