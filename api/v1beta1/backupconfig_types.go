@@ -372,3 +372,9 @@ type BackupConfigList struct {
 // informational: the backups are intact and their deletion is retried. It is removed
 // when no deletion is retained.
 const ConditionTypeBackupDeletionRetainedByLock = "BackupDeletionRetainedByLock"
+
+// ConditionTypeBackupDeletionFailing is present (status True) while the deletion of at
+// least one Backup of this BackupConfig fails for a reason other than a bucket lock
+// (BackupDeletionFailingAnnotationName). The Backups keep their finalizer and the
+// deletion is retried. It is removed when no deletion is failing.
+const ConditionTypeBackupDeletionFailing = "BackupDeletionFailing"

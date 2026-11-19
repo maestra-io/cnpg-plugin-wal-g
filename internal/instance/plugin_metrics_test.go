@@ -105,7 +105,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).NotTo(BeNil())
-			Expect(result.Metrics).To(HaveLen(9))
+			Expect(result.Metrics).To(HaveLen(10))
 
 			// Verify all expected metrics are defined
 			metricNames := make(map[string]bool)
@@ -125,6 +125,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 			Expect(metricNames).To(HaveKey(s3ReadAvailabilityMetricName))
 			Expect(metricNames).To(HaveKey(s3WriteAvailabilityMetricName))
 			Expect(metricNames).To(HaveKey(backupDeletionRetainedByLockMetricName))
+			Expect(metricNames).To(HaveKey(backupDeletionFailingMetricName))
 		})
 	})
 
@@ -159,7 +160,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result).NotTo(BeNil())
-				Expect(result.Metrics).To(HaveLen(9))
+				Expect(result.Metrics).To(HaveLen(10))
 
 				// Verify storage metrics are zero when ConsumedStorage is nil
 				for _, metric := range result.Metrics {
@@ -431,6 +432,38 @@ var _ = Describe("MetricsServerImplementation", func() {
 				}
 			})
 
+			It("should report a failing deletion", func() {
+				for _, failing := range []bool{true, false} {
+					backupConfig.Status.Conditions = nil
+					if failing {
+						backupConfig.Status.Conditions = []metav1.Condition{{
+							Type:   v1beta1.ConditionTypeBackupDeletionFailing,
+							Status: metav1.ConditionTrue,
+						}}
+					}
+					fakeClient := setupFakeClientForMetrics(backupConfig, cluster)
+					metricsServer = MetricsServerImplementation{Client: fakeClient}
+					clusterJSON, err := json.Marshal(cluster)
+					Expect(err).NotTo(HaveOccurred())
+
+					result, err := metricsServer.Collect(ctx, &metrics.CollectMetricsRequest{ClusterDefinition: clusterJSON})
+					Expect(err).NotTo(HaveOccurred())
+
+					found := false
+					for _, metric := range result.Metrics {
+						if metric.FqName == backupDeletionFailingMetricName {
+							found = true
+							want := float64(0)
+							if failing {
+								want = 1
+							}
+							Expect(metric.Value).To(Equal(want))
+						}
+					}
+					Expect(found).To(BeTrue())
+				}
+			})
+
 			It("should report a deletion retained by the bucket lock", func() {
 				for _, retained := range []bool{true, false} {
 					backupConfig.Status.Conditions = nil
@@ -591,7 +624,7 @@ var _ = Describe("MetricsServerImplementation", func() {
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result).NotTo(BeNil())
-				Expect(result.Metrics).To(HaveLen(9))
+				Expect(result.Metrics).To(HaveLen(10))
 
 				// All metrics should have zero values
 				for _, metric := range result.Metrics {

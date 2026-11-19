@@ -54,6 +54,15 @@ func TestReconcileRetainedDeletions(t *testing.T) {
 		t.Error("a retained deletion is not a failure: the phase stays healthy")
 	}
 
+	failing := backup("e", true, false)
+	failing.Annotations = map[string]string{v1beta1.BackupDeletionFailingAnnotationName: "2026-11-18T17:47:40Z"}
+	reconcileRetainedDeletions(bc, []cnpgv1.Backup{failing})
+	if len(bc.Status.Conditions) != 1 || bc.Status.Conditions[0].Type != v1beta1.ConditionTypeBackupDeletionFailing ||
+		bc.Status.Conditions[0].Message != "1 Backup(s) could not be deleted from storage (unreachable or refused), "+
+			"finalizer kept, deletion retried: e" {
+		t.Fatalf("got %+v", bc.Status.Conditions)
+	}
+
 	reconcileRetainedDeletions(bc, []cnpgv1.Backup{backup("d", true, false)})
 	if len(bc.Status.Conditions) != 0 {
 		t.Fatalf("condition must go when nothing is retained, got %+v", bc.Status.Conditions)

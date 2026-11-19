@@ -10,10 +10,10 @@ import (
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/go-logr/logr"
-	"github.com/samber/lo"
 	"github.com/wal-g/cnpg-plugin-wal-g/api/v1beta1"
 	"github.com/wal-g/cnpg-plugin-wal-g/pkg/walg"
 	"golang.org/x/sync/semaphore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -281,22 +281,28 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	}
 
 	backupConfig, err := v1beta1.GetBackupConfigForBackup(ctx, b, backup)
-	if client.IgnoreNotFound(err) != nil {
+	if apierrors.IsNotFound(err) {
+		// The BackupConfig is gone: no storage settings are left to delete with.
+		logger.Info("BackupConfig is gone, removing the finalizer without storage cleanup", "backup", backupKey)
+		return removeBackupFinalizer(ctx, backup, b.Client)
+	}
+	if err != nil {
 		return fmt.Errorf("while getting backupconfig for backup %v: %w", backupKey, err)
 	}
 
-	writableCondition, writableCondFound := lo.Find(backupConfig.Status.Conditions, func(c metav1.Condition) bool {
-		return c.Type == v1beta1.ConditionTypeStorageWritable
-	})
-
-	if writableCondFound && writableCondition.Status == metav1.ConditionFalse {
-		logger.Info("Skipping Backup data cleanup because storage is inaccessible", "backupConfig", backupKey)
+	if skipStorageCleanup(backup) || skipStorageCleanup(backupConfig) {
+		logger.Info("Skipping Backup data cleanup: requested by annotation, the backup stays in storage",
+			"backup", backupKey, "annotation", v1beta1.SkipStorageCleanupAnnotationName)
 		return removeBackupFinalizer(ctx, backup, b.Client)
 	}
 
+	// Storage that is unreachable or refuses us (StorageWritable False, 403, timeout, 5xx)
+	// is not a reason to give up: the finalizer stays and the deletion is retried, otherwise
+	// an outage (or whoever can fake one) turns the deletion into an orphaned backup.
 	backupConfigWithSecrets, err := backupConfig.PrefetchSecretsData(ctx, b)
 	if err != nil {
-		return fmt.Errorf("while prefetching backup secrets data for backup %v: %w", b, err)
+		return b.deletionFailed(ctx, backup,
+			fmt.Errorf("while prefetching backup secrets data for backup %v: %w", backupKey, err))
 	}
 
 	// Check if deletion management is disabled for individual backups
@@ -308,36 +314,61 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	// Delete the backup using WAL-G
 	logger.Info("Deleting backup from storage via WAL-G", "backupID", backup.Status.BackupID)
 	result, err := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion).DeleteBackup(ctx, backup.Status.BackupID)
-	if errors.Is(err, walg.ErrRetainedByLock) {
+	switch {
+	case errors.Is(err, walg.ErrRetainedByLock):
 		// Do not claim a deletion that did not happen: the finalizer stays, the Backup is
 		// marked, and the BackupConfig status counts it (status controller).
-		if markErr := markBackupRetainedByLock(ctx, b.Client, backup, time.Now()); markErr != nil {
+		if markErr := markBackup(ctx, b.Client, backup, v1beta1.BackupRetainedByLockAnnotationName,
+			v1beta1.BackupDeletionFailingAnnotationName, time.Now()); markErr != nil {
 			return fmt.Errorf("while marking backup %v retained by bucket lock: %w", backupKey, markErr)
 		}
 		return err
-	}
-	if err != nil {
-		return fmt.Errorf(
+	case errors.Is(err, walg.ErrStorageGone):
+		logger.Info("The bucket does not exist, nothing left to delete", "backup", backupKey)
+	case err != nil:
+		return b.deletionFailed(ctx, backup, fmt.Errorf(
 			"while wal-g backup removal: error %w\nWAL-G stdout: %s\nWAL-G stderr: %s",
 			err,
 			string(result.Stdout()),
 			string(result.Stderr()),
-		)
+		))
 	}
 
 	return removeBackupFinalizer(ctx, backup, b.Client)
 }
 
-// markBackupRetainedByLock sets BackupRetainedByLockAnnotationName (first refusal time) once.
-func markBackupRetainedByLock(ctx context.Context, c client.Client, backup *cnpgv1.Backup, now time.Time) error {
-	if _, ok := backup.Annotations[v1beta1.BackupRetainedByLockAnnotationName]; ok {
+// deletionFailed marks the Backup with BackupDeletionFailingAnnotationName (the status
+// controller turns it into ConditionTypeBackupDeletionFailing) and returns err; the
+// finalizer stays and the deletion is retried.
+func (b *BackupDeletionController) deletionFailed(ctx context.Context, backup *cnpgv1.Backup, err error) error {
+	if markErr := markBackup(ctx, b.Client, backup, v1beta1.BackupDeletionFailingAnnotationName,
+		v1beta1.BackupRetainedByLockAnnotationName, time.Now()); markErr != nil {
+		return errors.Join(err, fmt.Errorf("while marking backup deletion failing: %w", markErr))
+	}
+	return err
+}
+
+func skipStorageCleanup(obj metav1.Object) bool {
+	return obj.GetAnnotations()[v1beta1.SkipStorageCleanupAnnotationName] == "true"
+}
+
+// markBackup sets annotation set to now unless it is already set (it keeps the time of
+// the first occurrence) and removes annotation unset: a deletion is either retained by
+// the lock or failing, never both.
+func markBackup(ctx context.Context, c client.Client, backup *cnpgv1.Backup, set, unset string, now time.Time) error {
+	_, isSet := backup.Annotations[set]
+	_, isUnset := backup.Annotations[unset]
+	if isSet && !isUnset {
 		return nil
 	}
 	patch := client.MergeFrom(backup.DeepCopy())
 	if backup.Annotations == nil {
 		backup.Annotations = map[string]string{}
 	}
-	backup.Annotations[v1beta1.BackupRetainedByLockAnnotationName] = now.UTC().Format(time.RFC3339)
+	if !isSet {
+		backup.Annotations[set] = now.UTC().Format(time.RFC3339)
+	}
+	delete(backup.Annotations, unset)
 	return c.Patch(ctx, backup, patch)
 }
 
@@ -363,16 +394,14 @@ func (b *BackupDeletionController) deleteBackupConfig(ctx context.Context, backu
 		return client.IgnoreNotFound(err)
 	}
 
-	writableCondition, writableCondFound := lo.Find(backupConfig.Status.Conditions, func(c metav1.Condition) bool {
-		return c.Type == v1beta1.ConditionTypeStorageWritable
-	})
-
 	// Check if deletion management is disabled for BackupConfig
 	if backupConfig.Spec.Retention.IgnoreForBackupConfigDeletion {
 		logger.Info("Deletion management disabled for BackupConfig, skipping storage cleanup", "backupConfig", backupConfigKey)
-	} else if writableCondFound && writableCondition.Status == metav1.ConditionFalse {
-		logger.Info("Skipping BackupConfig storage cleanup because storage is inaccessible", "backupConfig", backupConfigKey)
+	} else if skipStorageCleanup(backupConfig) {
+		logger.Info("Skipping BackupConfig storage cleanup: requested by annotation, the data stays in storage",
+			"backupConfig", backupConfigKey, "annotation", v1beta1.SkipStorageCleanupAnnotationName)
 	} else {
+		// Unreachable or refusing storage keeps the finalizer and is retried, as for a Backup.
 		backupConfigWithSecrets, err := backupConfig.PrefetchSecretsData(ctx, b)
 		if err != nil {
 			return fmt.Errorf(
@@ -385,7 +414,10 @@ func (b *BackupDeletionController) deleteBackupConfig(ctx context.Context, backu
 		// Performing cleanup for all known PG versions (to remove both old-version backups and current backups)
 		for pgVersion := 11; pgVersion <= 19; pgVersion++ {
 			result, err := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion).DeleteAllBackupsAndWALsInStorage(ctx)
-			if err != nil && result != nil {
+			if errors.Is(err, walg.ErrStorageGone) {
+				logger.Info("The bucket does not exist, nothing left to delete", "backupConfig", backupConfigKey)
+				break
+			} else if err != nil && result != nil {
 				return fmt.Errorf(
 					"while wal-g storage cleanup: error %w\nWAL-G stdout: %s\nWAL-G stderr: %s",
 					err,

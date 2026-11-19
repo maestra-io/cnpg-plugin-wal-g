@@ -814,21 +814,32 @@ func getConditionStatus(backupConfig *v1beta1.BackupConfig, conditionType string
 
 // reconcileRetainedDeletions sets ConditionTypeBackupDeletionRetainedByLock while any
 // Backup of the BackupConfig is being deleted and its deletion was refused by a bucket
-// lock (BackupRetainedByLockAnnotationName), and removes the condition otherwise.
+// lock (BackupRetainedByLockAnnotationName), and ConditionTypeBackupDeletionFailing while
+// any deletion fails otherwise (BackupDeletionFailingAnnotationName). Each condition is
+// removed when no Backup is in that state.
 func reconcileRetainedDeletions(backupConfig *v1beta1.BackupConfig, backups []cnpgv1.Backup) {
-	retained := make([]string, 0)
+	reconcileDeletionCondition(backupConfig, backups, v1beta1.BackupRetainedByLockAnnotationName,
+		v1beta1.ConditionTypeBackupDeletionRetainedByLock, "RetainedByBucketLock",
+		"Backup(s) kept in storage by the bucket lock, deletion retried")
+	reconcileDeletionCondition(backupConfig, backups, v1beta1.BackupDeletionFailingAnnotationName,
+		v1beta1.ConditionTypeBackupDeletionFailing, "DeletionFailing",
+		"Backup(s) could not be deleted from storage (unreachable or refused), finalizer kept, deletion retried")
+}
+
+func reconcileDeletionCondition(backupConfig *v1beta1.BackupConfig, backups []cnpgv1.Backup,
+	annotation, conditionType, reason, what string) {
+	names := make([]string, 0)
 	for i := range backups {
-		_, marked := backups[i].Annotations[v1beta1.BackupRetainedByLockAnnotationName]
+		_, marked := backups[i].Annotations[annotation]
 		if marked && !backups[i].DeletionTimestamp.IsZero() {
-			retained = append(retained, backups[i].Name)
+			names = append(names, backups[i].Name)
 		}
 	}
-	if len(retained) == 0 {
-		meta.RemoveStatusCondition(&backupConfig.Status.Conditions, v1beta1.ConditionTypeBackupDeletionRetainedByLock)
+	if len(names) == 0 {
+		meta.RemoveStatusCondition(&backupConfig.Status.Conditions, conditionType)
 		return
 	}
-	sort.Strings(retained)
-	setCondition(backupConfig, v1beta1.ConditionTypeBackupDeletionRetainedByLock, metav1.ConditionTrue,
-		"RetainedByBucketLock", fmt.Sprintf("%d Backup(s) kept in storage by the bucket lock, deletion retried: %s",
-			len(retained), strings.Join(retained, ", ")))
+	sort.Strings(names)
+	setCondition(backupConfig, conditionType, metav1.ConditionTrue, reason,
+		fmt.Sprintf("%d %s: %s", len(names), what, strings.Join(names, ", ")))
 }

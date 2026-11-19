@@ -273,6 +273,9 @@ func (c *Client) DeleteBackup(ctx context.Context, backupName string) (*cmd.RunR
 	if IsRetainedByLock(result.Stderr()) {
 		return result, ErrRetainedByLock
 	}
+	if err != nil && IsStorageGone(result.Stderr()) {
+		return result, ErrStorageGone
+	}
 	// Do not abort if error not-nil and try anyway to perform `wal-g delete garbage` anyway
 
 	gcResult, gcErr := cmd.New("wal-g", "delete", "garbage", "--confirm").
@@ -316,6 +319,9 @@ func (c *Client) DeleteAllBackupsAndWALsInStorage(ctx context.Context) (*cmd.Run
 	if err == nil && IsRetainedByLock(result.Stderr()) {
 		err = ErrRetainedByLock
 	}
+	if err != nil && IsStorageGone(result.Stderr()) {
+		err = ErrStorageGone
+	}
 	return result, err
 }
 
@@ -330,6 +336,17 @@ var ErrRetainedByLock = errors.New("retained by bucket lock")
 func IsRetainedByLock(stderr []byte) bool {
 	return bytes.Contains(stderr, []byte("retained by bucket lock")) ||
 		bytes.Contains(stderr, []byte("ObjectLockedByBucketPolicy"))
+}
+
+// ErrStorageGone: the bucket itself does not exist (S3 error code NoSuchBucket), so
+// nothing is left to delete. Any other failure (403, signature error, timeout, 5xx,
+// wrong endpoint) is not "gone": the storage may come back and the caller must retry.
+var ErrStorageGone = errors.New("bucket does not exist")
+
+// IsStorageGone reports whether a failed wal-g run (its stderr) was refused with the S3
+// error code NoSuchBucket.
+func IsStorageGone(stderr []byte) bool {
+	return bytes.Contains(stderr, []byte("NoSuchBucket"))
 }
 
 // GetDependentBackups returns a list of backups that depend on the current backup.
