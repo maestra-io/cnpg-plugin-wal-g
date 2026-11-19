@@ -9,6 +9,8 @@ import (
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
+	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -19,8 +21,8 @@ import (
 	"github.com/wal-g/cnpg-plugin-wal-g/internal/util/cmd"
 )
 
-// fakeWalgOnPath puts a `wal-g` script first on PATH that answers "delete target" and
-// "delete everything" with answer ("<exit code>|<stderr>", or "hang" to never return) and
+// fakeWalgOnPath puts a `wal-g` script first on PATH that answers "delete target",
+// "delete everything" and the storage checks ("st check") with answer ("<exit code>|<stderr>", or "hang" to never return) and
 // every other call with exit 0. It returns a function reporting whether a delete was called.
 func fakeWalgOnPath(t *testing.T, answer string) func() bool {
 	t.Helper()
@@ -32,7 +34,7 @@ func fakeWalgOnPath(t *testing.T, answer string) func() bool {
 		reply = "echo '" + stderr + "' >&2; exit " + code
 	}
 	script := "#!/bin/sh\necho \"$*\" >> " + logPath + "\ncase \"$1 $2\" in\n" +
-		"  \"delete target\"*|\"delete everything\"*) " + reply + " ;;\nesac\nexit 0\n"
+		"  \"delete target\"*|\"delete everything\"*|\"st check\"*) " + reply + " ;;\nesac\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(dir, "wal-g"), []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -259,5 +261,29 @@ func TestDeleteBackupConfig_StorageFailureKeepsFinalizer(t *testing.T) {
 				t.Errorf("wal-g delete called = %v with the skip annotation = %v", called(), tc.annotated)
 			}
 		})
+	}
+}
+
+// The deletion conditions must show while the storage is unreachable: that is when a
+// deletion fails. The status reconcile skipped them whenever the read check failed.
+func TestStatusReportsFailingDeletionWhileStorageUnreachable(t *testing.T) {
+	fakeWalgOnPath(t, "1|ERROR: operation error S3: ListObjectsV2, StatusCode: 403, api error SignatureDoesNotMatch")
+	_, c := deletingBackup(t, map[string]string{v1beta1.BackupDeletionFailingAnnotationName: "2026-11-19T12:13:56Z"}, nil, true)
+	status := NewBackupConfigStatusController(c, time.Hour, 2*time.Second)
+	status.storageCheckRetryBackoff = 0
+
+	key := client.ObjectKey{Namespace: "ns", Name: "bc"}
+	if err := status.reconcileStatusByKey(context.Background(), key, logr.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	bc := &v1beta1.BackupConfig{}
+	if err := c.Get(context.Background(), key, bc); err != nil {
+		t.Fatal(err)
+	}
+	if meta.IsStatusConditionTrue(bc.Status.Conditions, v1beta1.ConditionTypeStorageReadable) {
+		t.Fatal("the storage check must fail in this test")
+	}
+	if !meta.IsStatusConditionTrue(bc.Status.Conditions, v1beta1.ConditionTypeBackupDeletionFailing) {
+		t.Errorf("BackupDeletionFailing must be set while the storage is unreachable, got %+v", bc.Status.Conditions)
 	}
 }
