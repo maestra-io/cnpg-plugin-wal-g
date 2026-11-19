@@ -115,3 +115,22 @@ func testBackupConfigWithS3Prefix(prefix string) *v1beta1.BackupConfigWithSecret
 	bc.Spec.Storage.S3 = &v1beta1.S3StorageConfigWithSecrets{ResolvedPrefix: prefix}
 	return bc
 }
+
+func TestDeleteBackup_BucketAbsentIsGone(t *testing.T) {
+	fakeWalg(t, map[string]string{
+		"delete target": "1|ERROR: operation error S3: ListObjectsV2, https response error StatusCode: 404, api error NoSuchBucket: The specified bucket does not exist.",
+	})
+	if err := runDelete(t); !errors.Is(err, ErrStorageGone) {
+		t.Fatalf("want ErrStorageGone, got %v", err)
+	}
+}
+
+func TestDeleteBackup_RefusedStorageIsNotGone(t *testing.T) {
+	fakeWalg(t, map[string]string{
+		"delete target": "1|ERROR: operation error S3: ListObjectsV2, https response error StatusCode: 403, api error SignatureDoesNotMatch",
+	})
+	err := runDelete(t)
+	if err == nil || errors.Is(err, ErrStorageGone) || errors.Is(err, ErrRetainedByLock) {
+		t.Fatalf("a 403 is a plain failure to retry, got %v", err)
+	}
+}

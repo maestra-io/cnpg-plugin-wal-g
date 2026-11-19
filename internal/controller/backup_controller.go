@@ -111,8 +111,8 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		// The finalizer stays until the backup is gone from storage. Come back after the
 		// deletion request's own timeout: a deletion refused by a bucket lock or failed is
-		// retried, a finished one finds the Backup gone.
-		return ctrl.Result{RequeueAfter: DeletionRequestTimeout + 2*time.Minute}, nil
+		// retried (backing off), a finished one finds the Backup gone.
+		return ctrl.Result{RequeueAfter: deletionRetryDelay(backup, time.Now())}, nil
 	}
 
 	// Set owner reference to BackupConfig
@@ -477,4 +477,19 @@ func buildDependentBackupsForBackup(
 	})
 
 	return result
+}
+
+// deletionRetryDelay is the deletion request's own timeout plus a margin, growing with
+// the time the deletion has been refused by a bucket lock or failing (a quarter of it),
+// up to an hour: a lock or an outage of days is not retried every few minutes.
+func deletionRetryDelay(backup *cnpgv1.Backup, now time.Time) time.Duration {
+	delay := DeletionRequestTimeout + 2*time.Minute
+	for _, annotation := range []string{
+		v1beta1.BackupRetainedByLockAnnotationName, v1beta1.BackupDeletionFailingAnnotationName,
+	} {
+		if since, err := time.Parse(time.RFC3339, backup.Annotations[annotation]); err == nil {
+			delay = max(delay, min(now.Sub(since)/4, time.Hour))
+		}
+	}
+	return delay
 }

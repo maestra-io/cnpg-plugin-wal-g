@@ -31,3 +31,16 @@ const BackupTypeIncremental BackupType = "incremental"
 // lock refuses to delete it from storage. The value is the time of the first refusal.
 // The finalizer stays and the deletion is retried until the lock age has passed.
 const BackupRetainedByLockAnnotationName = "cnpg-plugin-wal-g.yandex.cloud/retained-by-bucket-lock"
+
+// BackupDeletionFailingAnnotationName is set on a Backup being deleted while its deletion
+// from storage fails for any reason other than a bucket lock (storage unreachable, 403,
+// signature error, timeout, 5xx, missing credentials). The value is the time of the first
+// failure. The finalizer stays and the deletion is retried: an outage of the storage must
+// not turn a deletion into an orphaned backup.
+const BackupDeletionFailingAnnotationName = "cnpg-plugin-wal-g.yandex.cloud/deletion-failing"
+
+// SkipStorageCleanupAnnotationName, set to "true" on a Backup or on its BackupConfig,
+// makes the plugin remove its finalizers without deleting anything from storage. It is
+// the explicit escape hatch for a teardown whose storage will never be reachable again
+// (credentials revoked for good, endpoint decommissioned). The data stays in the bucket.
+const SkipStorageCleanupAnnotationName = "cnpg-plugin-wal-g.yandex.cloud/skip-storage-cleanup"

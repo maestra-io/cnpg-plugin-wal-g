@@ -54,6 +54,7 @@ var (
 	s3ReadAvailabilityMetricName           = buildFqName("s3_read_availability")
 	s3WriteAvailabilityMetricName          = buildFqName("s3_write_availability")
 	backupDeletionRetainedByLockMetricName = buildFqName("backup_deletion_retained_by_lock")
+	backupDeletionFailingMetricName        = buildFqName("backup_deletion_failing")
 )
 
 func (m MetricsServerImplementation) GetCapabilities(
@@ -125,6 +126,12 @@ func (m MetricsServerImplementation) Define(
 					"(the backup stays in storage, the deletion is retried), 0 otherwise",
 				ValueType: &metrics.MetricType{Type: metrics.MetricType_TYPE_GAUGE},
 			},
+			{
+				FqName: backupDeletionFailingMetricName,
+				Help: "1 while the deletion of at least one Backup from storage fails for a reason other than " +
+					"the bucket lock (storage unreachable or refusing; the finalizer stays, the deletion is retried), 0 otherwise",
+				ValueType: &metrics.MetricType{Type: metrics.MetricType_TYPE_GAUGE},
+			},
 		},
 	}, nil
 }
@@ -192,11 +199,20 @@ func (m MetricsServerImplementation) Collect(
 		backupDeletionRetainedByLock = 1
 	}
 
+	var backupDeletionFailing float64
+	if meta.IsStatusConditionTrue(backupConfig.Status.Conditions, v1beta1.ConditionTypeBackupDeletionFailing) {
+		backupDeletionFailing = 1
+	}
+
 	return &metrics.CollectMetricsResult{
 		Metrics: []*metrics.CollectMetric{
 			{
 				FqName: backupDeletionRetainedByLockMetricName,
 				Value:  backupDeletionRetainedByLock,
+			},
+			{
+				FqName: backupDeletionFailingMetricName,
+				Value:  backupDeletionFailing,
 			},
 			{
 				FqName: firstRecoverabilityPointMetricName,
