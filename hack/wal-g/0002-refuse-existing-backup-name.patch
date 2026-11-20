@@ -1,4 +1,4 @@
-From 44dc9f10a1d2c43a3aecf18ae3836a6964b88bb0 Mon Sep 17 00:00:00 2001
+From 21dd7b36b08815155c3bd905ecf0856d722b342e Mon Sep 17 00:00:00 2001
 From: cnpg-plugin-wal-g <noreply@maestra.io>
 Date: Fri, 20 Nov 2026 18:34:29 +0000
 Subject: [PATCH] postgres: refuse a backup name the storage already holds
@@ -72,7 +72,7 @@ index 0000000..036fede
 +	})
 +}
 diff --git a/internal/databases/postgres/backup_push_handler.go b/internal/databases/postgres/backup_push_handler.go
-index f13c9d7..e12b581 100644
+index f13c9d7..0408ad7 100644
 --- a/internal/databases/postgres/backup_push_handler.go
 +++ b/internal/databases/postgres/backup_push_handler.go
 @@ -206,6 +206,9 @@ func (bh *BackupHandler) createAndPushBackup(ctx context.Context) {
@@ -91,8 +91,8 @@ index f13c9d7..e12b581 100644
  
 +// assureBackupNameFree refuses a backup name that the storage already holds: its sentinel
 +// or any object under its folder. A backup is named after the WAL segment it starts in,
-+// and a standby starts at its last restart point, so with no checkpoint on the primary
-+// since the previous backup the next one gets the same name and would overwrite it
++// and a standby starts at its last restart point, so while that point stays in the segment
++// the previous backup started in, the next one gets the same name and would overwrite it
 +// (under an R2 bucket lock: add objects to it). It runs before anything is uploaded,
 +// on the final name (a delta backup's included).
 +func assureBackupNameFree(ctx context.Context, folder storage.Folder, name string) error {
@@ -105,8 +105,8 @@ index f13c9d7..e12b581 100644
 +		return errors.Wrapf(err, "failed to check whether backup %s exists", name)
 +	}
 +	if sentinel || len(objects) > 0 || len(subFolders) > 0 {
-+		return fmt.Errorf("backup %s already exists in storage: the backup starts at the same WAL segment "+
-+			"(no checkpoint since that backup, e.g. an idle database backed up from a standby); "+
++		return fmt.Errorf("backup %s already exists in storage: the backup starts in the same WAL segment "+
++			"(a standby whose restart point has not left that segment since, e.g. an idle database); "+
 +			"not writing into it", name)
 +	}
 +	return nil

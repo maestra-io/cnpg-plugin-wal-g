@@ -398,6 +398,12 @@ kubectl -n pg-dup wait clusters.postgresql.cnpg.io/pg --for=condition=Ready --ti
 primary=$(kubectl -n pg-dup get clusters.postgresql.cnpg.io pg -o jsonpath='{.status.currentPrimary}')
 psql_in pg-dup "$primary" "create table e2e(v text); insert into e2e values ('row-1'); checkpoint" >/dev/null
 psql_in pg-dup "$primary" "select pg_switch_wal()" >/dev/null
+# dup-1 must start at the restart point of that checkpoint: a standby still replaying
+# toward it would start dup-1 earlier and dup-2 at the new point, with another name.
+setup_lsn=$(psql_in pg-dup "$primary" "select pg_current_wal_lsn()")
+for p in $(kubectl -n pg-dup get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o name); do
+    wait_for "${p#pod/} replayed $setup_lsn" 120 bash -c "[[ \$(kubectl -n pg-dup exec ${p#pod/} -c postgres -- psql -U postgres -qtAX -c \"select pg_last_wal_replay_lsn() >= '$setup_lsn'\") == t ]]"
+done
 wait_for "pg-dup ContinuousArchiving=True" 300 bash -c "[[ \$(kubectl -n pg-dup get clusters.postgresql.cnpg.io pg -o jsonpath='{.status.conditions[?(@.type==\"ContinuousArchiving\")].status}') == True ]]"
 plugin_backup pg-dup dup-1 pg
 wait_for "Backup dup-1 finished" 600 bash -c "[[ \$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-1 -o jsonpath='{.status.phase}') =~ ^(completed|failed)$ ]]"

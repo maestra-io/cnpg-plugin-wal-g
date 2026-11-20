@@ -84,14 +84,14 @@ A storage that fails both attempts gives the same result as before: the conditio
 ## Backup names
 
 wal-g names a backup after the WAL segment it starts in (`base_<segment>`). A standby
-starts a backup at its last restart point, which moves only when the primary writes a
-checkpoint: two Backups from a standby of an idle database, with no checkpoint between
-them, get the same name. The second one fails right after `pg_backup_start`, before it
+starts a backup at its last restart point, which moves only with a checkpoint of the
+primary: two Backups from a standby whose restart point is still in the same segment (an
+idle database, no checkpoint or only a small write between them) get the same name. The second one fails right after `pg_backup_start`, before it
 uploads anything, with `backup base_<segment> already exists in storage`; the first one
 stays as it was. Before `-maestra.2` of the bundled wal-g it overwrote the first one (under
 an R2 bucket lock: added objects to it until a PutObject was refused). The first backup
-plus the archived WAL covers everything since it; a Backup taken after the next
-checkpoint (at most `checkpoint_timeout` later, if anything was written) succeeds.
+plus the archived WAL covers everything since it; a Backup succeeds once the standby's
+restart point is in a later segment.
 
 ## Deleting backups
 
