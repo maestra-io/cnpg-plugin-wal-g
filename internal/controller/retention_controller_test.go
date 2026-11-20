@@ -157,14 +157,11 @@ var _ = Describe("RetentionController", func() {
 				} else {
 					Expect(err).NotTo(HaveOccurred())
 
-					// For months, we can only approximate the check
+					// A month is a calendar month in local time: 28 to 31 days, plus or minus
+					// an hour when a DST change falls inside it, so compare with AddDate
 					if tc.retentionValue == "1m" {
-						// Check that it's roughly a month ago (between 28 and 31 days)
-						diff := now.Sub(threshold)
-						Expect(diff).To(And(
-							BeNumerically(">=", 28*24*time.Hour),
-							BeNumerically("<=", 31*24*time.Hour),
-						))
+						timeDiff := now.AddDate(0, -1, 0).Sub(threshold)
+						Expect(timeDiff).To(BeNumerically("<", 2*time.Second), "Time difference too large: %v", timeDiff)
 					} else {
 						// For other units, we can be more precise
 						expectedTime := now.Add(-tc.expectedDiff)
