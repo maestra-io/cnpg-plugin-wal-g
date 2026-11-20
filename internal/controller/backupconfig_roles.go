@@ -17,15 +17,97 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/cloudnative-pg/machinery/pkg/stringset"
+	"github.com/go-logr/logr"
 	"github.com/wal-g/cnpg-plugin-wal-g/api/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// BackupConfigsForCluster returns the BackupConfigs the cluster uses for archiving and for recovery
+func BackupConfigsForCluster(
+	ctx context.Context,
+	c client.Client,
+	cluster *cnpgv1.Cluster,
+) ([]v1beta1.BackupConfig, error) {
+	backupConfigs := make([]v1beta1.BackupConfig, 0, 2)
+
+	archiveBackupConfig, err := v1beta1.GetBackupConfigForCluster(ctx, c, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("while fetching backup config of cluster %s: %w", cluster.Name, err)
+	}
+	if archiveBackupConfig != nil {
+		backupConfigs = append(backupConfigs, *archiveBackupConfig)
+	}
+
+	recoveryBackupConfig, err := v1beta1.GetBackupConfigForClusterRecovery(ctx, c, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("while fetching recovery backup config of cluster %s: %w", cluster.Name, err)
+	}
+	if recoveryBackupConfig != nil {
+		backupConfigs = append(backupConfigs, *recoveryBackupConfig)
+	}
+
+	return backupConfigs, nil
+}
+
+// EnsureRoleForCluster makes the Role of the cluster grant access to exactly what backupConfigs reference.
+// A missing Role is created only when create is true.
+func EnsureRoleForCluster(
+	ctx context.Context,
+	c client.Client,
+	cluster *cnpgv1.Cluster,
+	backupConfigs []v1beta1.BackupConfig,
+	create bool,
+) error {
+	logger := logr.FromContextOrDiscard(ctx)
+
+	var role rbacv1.Role
+	if err := c.Get(ctx, client.ObjectKey{
+		Namespace: cluster.Namespace,
+		Name:      GetRoleNameForBackupConfig(cluster.Name),
+	}, &role); err != nil {
+		if !apierrs.IsNotFound(err) || !create {
+			return client.IgnoreNotFound(err)
+		}
+
+		newRole := rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      GetRoleNameForBackupConfig(cluster.Name),
+			},
+
+			Rules: []rbacv1.PolicyRule{},
+		}
+
+		BuildRoleForBackupConfigs(&newRole, cluster, backupConfigs)
+		logger.Info("Creating role", "role", newRole.TypeMeta)
+
+		return c.Create(ctx, &newRole)
+	}
+
+	// Role already exists, need to calculate changes and update
+	oldRole := role.DeepCopy()
+
+	BuildRoleForBackupConfigs(&role, cluster, backupConfigs)
+	if equality.Semantic.DeepEqual(&role, oldRole) {
+		// There's no need to hit the API server again
+		return nil
+	}
+
+	patchData, _ := client.MergeFrom(oldRole).Data(&role)
+	logger.Info("Patching role", "role", role.TypeMeta, "patch", string(patchData))
+
+	return c.Patch(ctx, &role, client.MergeFrom(oldRole))
+}
 
 // BuildRole builds the Role object for this cluster
 // It collects all BackupConfig objects used by cluster and grants read/watch permissions on them only

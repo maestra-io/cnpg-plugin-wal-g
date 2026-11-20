@@ -46,6 +46,7 @@ type BackupConfigReconciler struct {
 // +kubebuilder:rbac:groups=cnpg-extensions.yandex.cloud,resources=backupconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cnpg-extensions.yandex.cloud,resources=backupconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cnpg-extensions.yandex.cloud,resources=backupconfigs/finalizers,verbs=update
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;patch;get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;patch;list;get;watch;delete
@@ -63,8 +64,6 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// The Backup resource may have been deleted
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-
-	// TODO(endevir): Watch for secrets name change and reconcile cluster role
 
 	if !backupConfig.DeletionTimestamp.IsZero() {
 		// BackupConfig is marked for deletion
@@ -132,7 +131,42 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	r.reconcileReferencedSecrets(ctx, backupConfig)
 	r.reconcileReferencedConfigMaps(ctx, backupConfig)
 
+	if err := r.reconcileClusterRoles(ctx, backupConfig); err != nil {
+		logger.Error(err, "while updating Roles of the clusters using BackupConfig")
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
+}
+
+// reconcileClusterRoles updates the Role of every Cluster that uses this BackupConfig.
+// Without it a Secret the BackupConfig starts to reference (an encryption key) stays forbidden
+// to the instances until CNPG reconciles the Cluster, and a backup taken in between fails.
+// The Role itself is created by the Cluster reconciler hook, together with its RoleBinding.
+func (r *BackupConfigReconciler) reconcileClusterRoles(ctx context.Context, backupConfig *v1beta1.BackupConfig) error {
+	clusters := cnpgv1.ClusterList{}
+	if err := r.List(ctx, &clusters, client.InNamespace(backupConfig.Namespace)); err != nil {
+		return fmt.Errorf("while listing clusters: %w", err)
+	}
+
+	backupConfigKey := client.ObjectKeyFromObject(backupConfig)
+	for i := range clusters.Items {
+		cluster := &clusters.Items[i]
+		if !v1beta1.BackupConfigIsUsedForArchivation(backupConfigKey, cluster) &&
+			!v1beta1.BackupConfigIsUsedForRecovery(backupConfigKey, cluster) {
+			continue
+		}
+
+		backupConfigs, err := BackupConfigsForCluster(ctx, r.Client, cluster)
+		if err != nil {
+			return err
+		}
+		if err := EnsureRoleForCluster(ctx, r.Client, cluster, backupConfigs, false); err != nil {
+			return fmt.Errorf("while updating role of cluster %s: %w", cluster.Name, err)
+		}
+	}
+
+	return nil
 }
 
 func (r *BackupConfigReconciler) reconcileReferencedSecrets(ctx context.Context, backupConfig *v1beta1.BackupConfig) {

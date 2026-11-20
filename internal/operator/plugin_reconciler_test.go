@@ -450,7 +450,7 @@ var _ = Describe("ReconcilerImplementation", func() {
 		})
 
 		It("should create a new Role when it doesn't exist", func() {
-			err := reconciler.ensureRole(ctx, testCluster, []v1beta1.BackupConfig{*backupConfig})
+			err := controller.EnsureRoleForCluster(ctx, fakeClient, testCluster, []v1beta1.BackupConfig{*backupConfig}, true)
 			Expect(err).NotTo(HaveOccurred())
 
 			var role rbacv1.Role
@@ -464,7 +464,7 @@ var _ = Describe("ReconcilerImplementation", func() {
 
 		It("should update an existing Role when it changes", func() {
 			// First create the Role
-			err := reconciler.ensureRole(ctx, testCluster, []v1beta1.BackupConfig{*backupConfig})
+			err := controller.EnsureRoleForCluster(ctx, fakeClient, testCluster, []v1beta1.BackupConfig{*backupConfig}, true)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Create a new BackupConfig with different secret
@@ -473,7 +473,7 @@ var _ = Describe("ReconcilerImplementation", func() {
 			newBackupConfig.Spec.Storage.S3.AccessKeySecretRef.Name = "new-test-secret"
 
 			// Update the Role
-			err = reconciler.ensureRole(ctx, testCluster, []v1beta1.BackupConfig{*newBackupConfig})
+			err = controller.EnsureRoleForCluster(ctx, fakeClient, testCluster, []v1beta1.BackupConfig{*newBackupConfig}, true)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Check if Role was updated

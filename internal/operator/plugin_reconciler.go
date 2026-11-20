@@ -28,7 +28,6 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -125,7 +124,7 @@ func (r ReconcilerImplementation) Pre(
 		}
 	}
 
-	if err := r.ensureRole(ctx, cluster, backupConfigs); err != nil {
+	if err := controller.EnsureRoleForCluster(ctx, r.Client, cluster, backupConfigs, true); err != nil {
 		return &reconciler.ReconcilerHooksResult{
 			Behavior: reconciler.ReconcilerHooksResult_BEHAVIOR_REQUEUE,
 		}, err
@@ -150,52 +149,6 @@ func (r ReconcilerImplementation) Post(
 	return &reconciler.ReconcilerHooksResult{
 		Behavior: reconciler.ReconcilerHooksResult_BEHAVIOR_CONTINUE,
 	}, nil
-}
-
-func (r ReconcilerImplementation) ensureRole(
-	ctx context.Context,
-	cluster *cnpgv1.Cluster,
-	backupConfigs []v1beta1.BackupConfig,
-) error {
-	logger := logr.FromContextOrDiscard(ctx)
-
-	var role rbacv1.Role
-	if err := r.Client.Get(ctx, client.ObjectKey{
-		Namespace: cluster.Namespace,
-		Name:      controller.GetRoleNameForBackupConfig(cluster.Name),
-	}, &role); err != nil {
-		if !apierrs.IsNotFound(err) {
-			return err
-		}
-
-		newRole := rbacv1.Role{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: cluster.Namespace,
-				Name:      controller.GetRoleNameForBackupConfig(cluster.Name),
-			},
-
-			Rules: []rbacv1.PolicyRule{},
-		}
-
-		controller.BuildRoleForBackupConfigs(&newRole, cluster, backupConfigs)
-		logger.Info("Creating role", "role", newRole.TypeMeta)
-
-		return r.Client.Create(ctx, &newRole)
-	}
-
-	// Role already exists, need to calculate changes and update
-	oldRole := role.DeepCopy()
-
-	controller.BuildRoleForBackupConfigs(&role, cluster, backupConfigs)
-	if equality.Semantic.DeepEqual(&role, oldRole) {
-		// There's no need to hit the API server again
-		return nil
-	}
-
-	patchData, _ := client.MergeFrom(oldRole).Data(&role)
-	logger.Info("Patching role", "role", role.TypeMeta, "patch", string(patchData))
-
-	return r.Client.Patch(ctx, &role, client.MergeFrom(oldRole))
 }
 
 func (r ReconcilerImplementation) ensureRoleBinding(
