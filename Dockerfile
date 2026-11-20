@@ -27,7 +27,7 @@ ARG USE_LIBSODIUM=1
 ARG USE_LZO=1
 
 # Install lib dependencies
-RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     . /nora-apt/env.sh && apt-get update && apt-get install -y libbrotli-dev liblzo2-dev libsodium-dev curl cmake git
 # Fetch exactly WALG_COMMIT (GitHub serves a reachable commit by SHA; `git clone --branch` takes refs only)
 RUN git init -q $(go env GOPATH)/src/github.com/wal-g/wal-g && \
@@ -102,7 +102,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 # dependency tree carried HIGH CVEs. --no-install-recommends keeps psmisc,
 # bash-completion & co. out; upgrade picks up Debian security fixes released
 # after the base image was built.
-RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     . /nora-apt/env.sh && apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends ca-certificates procps && \
