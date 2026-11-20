@@ -91,7 +91,13 @@ uploads anything, with `backup base_<segment> already exists in storage`; the fi
 stays as it was. Before `-maestra.2` of the bundled wal-g it overwrote the first one (under
 an R2 bucket lock: added objects to it until a PutObject was refused). The first backup
 plus the archived WAL covers everything since it; a Backup succeeds once the standby's
-restart point is in a later segment.
+restart point is in a later segment (after a `CHECKPOINT` on the primary, or its
+`checkpoint_timeout`).
+
+The same error with `as the objects of an unfinished backup` means the folder holds objects
+but no sentinel: an earlier backup-push that started in that segment failed. Those objects
+are not a backup. Remove them where the bucket lock allows it, or retry after a checkpoint
+on the primary.
 
 ## Deleting backups
 
