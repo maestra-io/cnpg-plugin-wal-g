@@ -1,4 +1,4 @@
-From 3a5dafb03d2cdba029d963a312b6ae5b089aaddf Mon Sep 17 00:00:00 2001
+From f1051f12f512b0afda09e19aba9d48426cd61117 Mon Sep 17 00:00:00 2001
 From: cnpg-plugin-wal-g <noreply@maestra.io>
 Date: Fri, 20 Nov 2026 18:34:29 +0000
 Subject: [PATCH] postgres: refuse a backup name the storage already holds
@@ -14,8 +14,8 @@ any object under the backup's folder exists, and fails otherwise.
 issues-maestra#1786
 ---
  .../postgres/backup_name_taken_test.go        | 51 +++++++++++++++++++
- .../databases/postgres/backup_push_handler.go | 31 +++++++++++
- 2 files changed, 82 insertions(+)
+ .../databases/postgres/backup_push_handler.go | 33 ++++++++++++
+ 2 files changed, 84 insertions(+)
  create mode 100644 internal/databases/postgres/backup_name_taken_test.go
 
 diff --git a/internal/databases/postgres/backup_name_taken_test.go b/internal/databases/postgres/backup_name_taken_test.go
@@ -76,7 +76,7 @@ index 0000000..2ed4cfd
 +	})
 +}
 diff --git a/internal/databases/postgres/backup_push_handler.go b/internal/databases/postgres/backup_push_handler.go
-index f13c9d7..34ba057 100644
+index f13c9d7..d95d951 100644
 --- a/internal/databases/postgres/backup_push_handler.go
 +++ b/internal/databases/postgres/backup_push_handler.go
 @@ -206,6 +206,9 @@ func (bh *BackupHandler) createAndPushBackup(ctx context.Context) {
@@ -89,7 +89,7 @@ index f13c9d7..34ba057 100644
  	tarFileSets := bh.uploadBackup(ctx)
  	sentinelDto, filesMetaDto, err := bh.setupDTO(ctx, tarFileSets)
  	tracelog.ErrorLogger.FatalOnError(err)
-@@ -274,6 +277,34 @@ func (bh *BackupHandler) startBackup(ctx context.Context) error {
+@@ -274,6 +277,36 @@ func (bh *BackupHandler) startBackup(ctx context.Context) error {
  	return nil
  }
  
@@ -111,12 +111,14 @@ index f13c9d7..34ba057 100644
 +	if sentinel {
 +		return fmt.Errorf("backup %s already exists in storage: the backup starts in the same WAL segment "+
 +			"(a standby whose restart point has not left that segment since, e.g. an idle database); "+
-+			"not writing into it; retry after a checkpoint on the primary", name)
++			"not writing into it; to start a new one, run pg_switch_wal() and then CHECKPOINT on the primary, "+
++			"and retry once the standby has replayed them", name)
 +	}
 +	if len(objects) > 0 || len(subFolders) > 0 {
 +		return fmt.Errorf("backup %s already exists in storage as the objects of an unfinished backup "+
 +			"(no sentinel: an earlier backup-push that started in the same WAL segment failed); "+
-+			"not writing into it; remove them, or retry after a checkpoint on the primary", name)
++			"not writing into it; remove them where the storage allows it, or run pg_switch_wal() and then "+
++			"CHECKPOINT on the primary, and retry once the standby has replayed them", name)
 +	}
 +	return nil
 +}
