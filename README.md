@@ -81,6 +81,58 @@ So that a storage latency blip does not flip them to `False` while WAL archiving
 A storage that fails both attempts gives the same result as before: the condition is
 `False`, with the last error as its message, and the metric is `0`.
 
+## Deleting backups
+
+A deleted `Backup` keeps the finalizer `cnpg-plugin-wal-g.yandex.cloud/backup-cleanup` until
+its data is gone from storage, because retention works from `Backup` resources only: data
+whose resource is gone is never pruned again. The finalizer is released without deleting
+data only when:
+
+- the Backup has no physical backup (`status.backupID` empty);
+- the bucket does not exist (S3 `NoSuchBucket`);
+- `retention.ignoreForBackupDeletion: true`;
+- the annotation `cnpg-plugin-wal-g.yandex.cloud/skip-storage-cleanup: "true"` is on the
+  Backup (or on its BackupConfig, while that exists).
+
+Anything else keeps the finalizer and marks the Backup
+`cnpg-plugin-wal-g.yandex.cloud/deletion-failing` (time of the first failure). The
+BackupConfig gets condition `BackupDeletionFailing` and the sidecar exports
+`cnpg_plugin_wal_g_backup_deletion_failing 1`; retries back off from 7 minutes to 1 hour.
+A deletion refused by an R2 bucket lock is not a failure: `retained-by-bucket-lock`,
+condition `BackupDeletionRetainedByLock`, metric `..._backup_deletion_retained_by_lock`.
+
+| Condition reason | Cause | What to do |
+|---|---|---|
+| `DeletionFailing` | storage unreachable or refusing (403, 5xx, timeout, DNS, missing credentials) | fix the storage or its credentials; the retry deletes the data |
+| `BackupConfigNotFound` | the Backup's BackupConfig was deleted first, or re-created as another object (new UID) | see below |
+
+### The BackupConfig is gone
+
+A BackupConfig deleted before its Backups (a namespace teardown, a delete by hand; the
+owner reference then makes the garbage collector delete the Backups) leaves no storage
+settings to delete with. The Backups stay in `Terminating` with the deletion-failing mark,
+and every other BackupConfig of the namespace reports them under reason
+`BackupConfigNotFound`. A BackupConfig re-created under the same name is another object and
+does not delete them: deleting a BackupConfig never deletes backup data by itself.
+
+A namespace being deleted stays `Terminating` with condition `NamespaceFinalizersRemaining`
+naming the finalizer above, and nothing in it (no BackupConfig, no sidecar, no alert rule)
+reports it any more. List what blocks it with
+`kubectl get backups.postgresql.cnpg.io -n <ns> -o custom-columns=NAME:.metadata.name,ID:.status.backupID,OWNER:.metadata.ownerReferences[0].name`.
+
+Then decide per Backup:
+
+- keep the data (a restore point, a move to another namespace): annotate the Backup
+  `kubectl annotate backups.postgresql.cnpg.io -n <ns> <name> cnpg-plugin-wal-g.yandex.cloud/skip-storage-cleanup=true`.
+  The data stays in the bucket outside retention; delete it later with `wal-g delete target`
+  or let the bucket lifecycle expire it;
+- delete the data: run `wal-g delete target <backupID>` with the storage credentials, then
+  annotate as above.
+
+To tear a namespace down with its backups deleted, delete the Backups first and wait until
+they are gone (`kubectl delete backups.postgresql.cnpg.io -n <ns> --all --wait`), then the
+namespace. Under an R2 bucket lock, Backups younger than the lock wait until they are older.
+
 ## Dependencies
 
 - [Kubernetes](https://kubernetes.io/releases/) version 1.28 or higher

@@ -111,9 +111,8 @@ func (b *BackupDeletionController) EnqueueBackupDeletion(ctx context.Context, ba
 	if client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("failed to get BackupConfig for Backup: %w", err)
 	}
-	if err != nil {
-		// If BackupConfig not found, then it's already deleted, just remove finalizer from Backup and do nothing else
-		return removeBackupFinalizer(ctx, backup, b.Client)
+	if err != nil || !ownedBy(backup, backupConfig) {
+		return b.backupConfigGone(ctx, backup)
 	}
 
 	backupKey := client.ObjectKeyFromObject(backup)
@@ -282,12 +281,13 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 
 	backupConfig, err := v1beta1.GetBackupConfigForBackup(ctx, b, backup)
 	if apierrors.IsNotFound(err) {
-		// The BackupConfig is gone: no storage settings are left to delete with.
-		logger.Info("BackupConfig is gone, removing the finalizer without storage cleanup", "backup", backupKey)
-		return removeBackupFinalizer(ctx, backup, b.Client)
+		return b.backupConfigGone(ctx, backup)
 	}
 	if err != nil {
 		return fmt.Errorf("while getting backupconfig for backup %v: %w", backupKey, err)
+	}
+	if !ownedBy(backup, backupConfig) {
+		return b.backupConfigGone(ctx, backup)
 	}
 
 	if skipStorageCleanup(backup) || skipStorageCleanup(backupConfig) {
@@ -335,6 +335,45 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	}
 
 	return removeBackupFinalizer(ctx, backup, b.Client)
+}
+
+// ownedBy reports whether the Backup's owner reference names this very BackupConfig
+// object, not an earlier one of the same name.
+func ownedBy(backup *cnpgv1.Backup, backupConfig *v1beta1.BackupConfig) bool {
+	for _, ref := range backup.OwnerReferences {
+		if ref.Kind == "BackupConfig" && ref.Name == backupConfig.Name {
+			return ref.UID == backupConfig.UID
+		}
+	}
+	return false
+}
+
+// backupConfigGone handles a Backup being deleted whose BackupConfig no longer exists (it
+// was deleted first: namespace teardown, a delete by hand; the owner reference then makes
+// the garbage collector delete the Backup). No storage settings are left to delete with,
+// but the data is still in the bucket, where retention (which works from Backup resources)
+// never sees it again. So the finalizer stays and the Backup is marked deletion-failing
+// (condition reason BackupConfigNotFound) until the Backup carries the skip-storage-cleanup
+// annotation. A BackupConfig re-created under the same name is another object (UID) and
+// does not delete the data: deleting a BackupConfig never deletes backups by itself.
+func (b *BackupDeletionController) backupConfigGone(ctx context.Context, backup *cnpgv1.Backup) error {
+	logger := logr.FromContextOrDiscard(ctx)
+	switch {
+	case !containsString(backup.Finalizers, v1beta1.BackupFinalizerName):
+		return nil
+	case backup.Status.BackupID == "", skipStorageCleanup(backup):
+		// No physical backup, or the operator decided the data stays (or is removed by hand).
+		return removeBackupFinalizer(ctx, backup, b.Client)
+	}
+	logger.Info("The Backup's BackupConfig is gone, keeping the finalizer: the backup is still in storage. "+
+		"Annotate the Backup to release it",
+		"backup", client.ObjectKeyFromObject(backup), "backupID", backup.Status.BackupID,
+		"annotation", v1beta1.SkipStorageCleanupAnnotationName)
+	if err := markBackup(ctx, b.Client, backup, v1beta1.BackupDeletionFailingAnnotationName,
+		v1beta1.BackupRetainedByLockAnnotationName, time.Now()); err != nil {
+		return fmt.Errorf("while marking backup deletion failing: %w", err)
+	}
+	return nil
 }
 
 // deletionFailed marks the Backup with BackupDeletionFailingAnnotationName (the status

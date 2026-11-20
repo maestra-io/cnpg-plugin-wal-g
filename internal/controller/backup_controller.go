@@ -98,8 +98,11 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Backup is being deleted - need to reconcile related backups annotations and to remove physical wal-g backup
 	if !backup.DeletionTimestamp.IsZero() {
-		// If backup has dependents or is dependent, then its deletion requires to update annotations
-		if err := r.reconcileRelatedBackupsMetadata(ctx, backup); err != nil {
+		// If backup has dependents or is dependent, then its deletion requires to update annotations.
+		// Without a BackupConfig there is nothing to update and the deletion controller handles
+		// the Backup (finalizer kept, Backup marked): an error here looped forever, unreported,
+		// and the skip-storage-cleanup annotation never got read.
+		if err := r.reconcileRelatedBackupsMetadata(ctx, backup); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
 		}
 

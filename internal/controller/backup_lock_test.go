@@ -45,7 +45,7 @@ func TestReconcileRetainedDeletions(t *testing.T) {
 	}
 	bc := &v1beta1.BackupConfig{}
 
-	reconcileRetainedDeletions(bc, []cnpgv1.Backup{backup("b", true, true), backup("a", true, true), backup("c", false, true)})
+	reconcileRetainedDeletions(bc, []cnpgv1.Backup{backup("b", true, true), backup("a", true, true), backup("c", false, true)}, nil)
 	if len(bc.Status.Conditions) != 1 || bc.Status.Conditions[0].Status != metav1.ConditionTrue ||
 		bc.Status.Conditions[0].Message != "2 Backup(s) kept in storage by the bucket lock, deletion retried: a, b" {
 		t.Fatalf("got %+v", bc.Status.Conditions)
@@ -56,14 +56,14 @@ func TestReconcileRetainedDeletions(t *testing.T) {
 
 	failing := backup("e", true, false)
 	failing.Annotations = map[string]string{v1beta1.BackupDeletionFailingAnnotationName: "2026-11-18T17:47:40Z"}
-	reconcileRetainedDeletions(bc, []cnpgv1.Backup{failing})
+	reconcileRetainedDeletions(bc, []cnpgv1.Backup{failing}, nil)
 	if len(bc.Status.Conditions) != 1 || bc.Status.Conditions[0].Type != v1beta1.ConditionTypeBackupDeletionFailing ||
 		bc.Status.Conditions[0].Message != "1 Backup(s) could not be deleted from storage (unreachable or refused), "+
 			"finalizer kept, deletion retried: e" {
 		t.Fatalf("got %+v", bc.Status.Conditions)
 	}
 
-	reconcileRetainedDeletions(bc, []cnpgv1.Backup{backup("d", true, false)})
+	reconcileRetainedDeletions(bc, []cnpgv1.Backup{backup("d", true, false)}, nil)
 	if len(bc.Status.Conditions) != 0 {
 		t.Fatalf("condition must go when nothing is retained, got %+v", bc.Status.Conditions)
 	}
