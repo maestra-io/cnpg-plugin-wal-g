@@ -81,6 +81,18 @@ So that a storage latency blip does not flip them to `False` while WAL archiving
 A storage that fails both attempts gives the same result as before: the condition is
 `False`, with the last error as its message, and the metric is `0`.
 
+## Backup names
+
+wal-g names a backup after the WAL segment it starts in (`base_<segment>`). A standby
+starts a backup at its last restart point, which moves only when the primary writes a
+checkpoint: two Backups from a standby of an idle database, with no checkpoint between
+them, get the same name. The second one fails right after `pg_backup_start`, before it
+uploads anything, with `backup base_<segment> already exists in storage`; the first one
+stays as it was. Before `-maestra.2` of the bundled wal-g it overwrote the first one (under
+an R2 bucket lock: added objects to it until a PutObject was refused). The first backup
+plus the archived WAL covers everything since it; a Backup taken after the next
+checkpoint (at most `checkpoint_timeout` later, if anything was written) succeeds.
+
 ## Deleting backups
 
 A deleted `Backup` keeps the finalizer `cnpg-plugin-wal-g.yandex.cloud/backup-cleanup` until

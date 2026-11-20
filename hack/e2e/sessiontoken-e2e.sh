@@ -14,6 +14,10 @@
 #     - restore through the plugin into a new Cluster, replaying WAL archived after the backup
 #   negative control (namespace pg-neg, a valid STS triple, BackupConfig WITHOUT sessionToken)
 #     - archiving fails with an S3 auth error, archived_count stays 0, a Backup fails
+#   same backup name (namespace pg-dup, 2 instances, backups from the standby)
+#     - two Backups with no checkpoint between them start at the same restart point, so
+#       wal-g names both after the same segment; the second must fail before it writes
+#       anything instead of overwriting the first (issues-maestra#1786)
 #
 # Needs: docker (IMAGE already built), kind, kubectl, helm, aws (CLI v2), jq.
 #   IMAGE=docker.io/local/cnpg-plugin-wal-g:e2e hack/e2e/sessiontoken-e2e.sh
@@ -158,7 +162,7 @@ apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata: {name: $2, namespace: $1}
 spec:
-  instances: 1
+  instances: ${INSTANCES:-1}
   imageName: $PG_IMAGE
   imagePullPolicy: IfNotPresent
   storage: {size: 1Gi}
@@ -273,13 +277,24 @@ kubectl create namespace pg-pos
 apply_creds_secret pg-pos "$KEY1" "$SECRET1" "$TOKEN1"
 kubectl create namespace pg-neg
 apply_creds_secret pg-neg "$KEYN" "$SECRETN" "$TOKENN"
-for ns in pg-pos pg-neg; do
+read -r KEYD SECRETD TOKEND <<<"$(mint_sts)"
+[ -n "$TOKEND" ] || fail "MinIO STS returned no session token for the pg-dup triple"
+kubectl create namespace pg-dup
+apply_creds_secret pg-dup "$KEYD" "$SECRETD" "$TOKEND"
+for ns in pg-pos pg-neg pg-dup; do
     kubectl -n "$ns" create secret generic walg-encryption --from-literal=libsodiumKey="$(openssl rand -hex 32)"
 done
 backup_config pg-pos walg pg-pos true
 backup_config pg-neg walg pg-neg false
 pg_cluster pg-pos pg walg
 pg_cluster pg-neg pg walg
+backup_config pg-dup walg pg-dup true
+# Backups from the standby, as our clusters take them; no timed checkpoint during the test.
+INSTANCES=2 pg_cluster pg-dup pg walg "  backup:
+    target: prefer-standby
+  postgresql:
+    parameters:
+      checkpoint_timeout: 30min"
 
 # ---------------------------------------------------------------- positive
 kubectl -n pg-pos wait clusters.postgresql.cnpg.io/pg --for=condition=Ready --timeout=900s
@@ -373,6 +388,40 @@ plugin_backup pg-neg backup-neg pg
 wait_for "Backup backup-neg finished" 600 bash -c "[[ \$(kubectl -n pg-neg get backups.postgresql.cnpg.io backup-neg -o jsonpath='{.status.phase}') =~ ^(completed|failed)$ ]]"
 [ "$(backup_phase pg-neg backup-neg)" = failed ] || fail "backup-neg phase=$(backup_phase pg-neg backup-neg), expected failed"
 pass "negative control (no sessionToken): S3 error $autherr, archived_count=0 failed_count=$failed last_failed_wal=$last_failed, backup-neg failed"
+
+# ---------------------------------------------------------------- same backup name
+# A standby starts a backup at its last restart point, and wal-g names the backup after
+# that segment. With no checkpoint on the primary between two Backups (omega db-coder,
+# 20.11.2026: an idle database), both get the same name; up to wal-g -maestra.1 the
+# second one overwrote the first (under an R2 bucket lock: added objects to it).
+kubectl -n pg-dup wait clusters.postgresql.cnpg.io/pg --for=condition=Ready --timeout=900s
+primary=$(kubectl -n pg-dup get clusters.postgresql.cnpg.io pg -o jsonpath='{.status.currentPrimary}')
+psql_in pg-dup "$primary" "create table e2e(v text); insert into e2e values ('row-1'); checkpoint" >/dev/null
+psql_in pg-dup "$primary" "select pg_switch_wal()" >/dev/null
+wait_for "pg-dup ContinuousArchiving=True" 300 bash -c "[[ \$(kubectl -n pg-dup get clusters.postgresql.cnpg.io pg -o jsonpath='{.status.conditions[?(@.type==\"ContinuousArchiving\")].status}') == True ]]"
+plugin_backup pg-dup dup-1 pg
+wait_for "Backup dup-1 finished" 600 bash -c "[[ \$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-1 -o jsonpath='{.status.phase}') =~ ^(completed|failed)$ ]]"
+[ "$(backup_phase pg-dup dup-1)" = completed ] || fail "dup-1 phase=$(backup_phase pg-dup dup-1): $(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-1 -o jsonpath='{.status.error}')"
+D1=$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-1 -o jsonpath='{.status.backupId}')
+dup_pod=$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-1 -o jsonpath='{.status.instanceID.podName}')
+[ "$dup_pod" != "$primary" ] || fail "dup-1 ran on the primary $primary; the test needs a backup from the standby"
+mc_in ls --recursive --json "local/$BUCKET/pg-dup/$PG_MAJOR/basebackups_005/" | jq -c --arg b "$D1" 'select(.key | startswith($b)) | {key, etag, size}' | sort > /tmp/dup-1-objects.json
+[ -s /tmp/dup-1-objects.json ] || fail "no objects of $D1 in MinIO"
+# WAL without a checkpoint, as an idle primary writes: the standby replays past dup-1's
+# end (the plugin's own "no changes since the previous backup" check passes) while its
+# restart point stays where dup-1 started.
+lsn=$(psql_in pg-dup "$primary" "select pg_logical_emit_message(false, 'e2e', 'no checkpoint', true)")
+wait_for "standby $dup_pod replayed $lsn" 120 bash -c "[[ \$(kubectl -n pg-dup exec $dup_pod -c postgres -- psql -U postgres -qtAX -c \"select pg_last_wal_replay_lsn() >= '$lsn'\") == t ]]"
+plugin_backup pg-dup dup-2 pg
+wait_for "Backup dup-2 finished" 600 bash -c "[[ \$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-2 -o jsonpath='{.status.phase}') =~ ^(completed|failed)$ ]]"
+D2=$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-2 -o jsonpath='{.status.backupId}')
+err2=$(kubectl -n pg-dup get backups.postgresql.cnpg.io dup-2 -o jsonpath='{.status.error}')
+mc_in ls --recursive --json "local/$BUCKET/pg-dup/$PG_MAJOR/basebackups_005/" | jq -c --arg b "$D1" 'select(.key | startswith($b)) | {key, etag, size}' | sort > /tmp/dup-2-objects.json
+[ "$D2" != "$D1" ] || fail "dup-2 reused the backup name $D1 and overwrote dup-1"
+diff /tmp/dup-1-objects.json /tmp/dup-2-objects.json >&2 || fail "objects of $D1 changed after dup-2"
+[ "$(backup_phase pg-dup dup-2)" = failed ] || fail "dup-2 phase=$(backup_phase pg-dup dup-2) backupId=$D2: expected a refusal of $D1"
+grep -q "$D1 already exists in storage" <<<"$err2" || fail "dup-2 failed for another reason: $err2"
+pass "same backup name: dup-2 (from $dup_pod, no checkpoint since dup-1) refused $D1 before writing, its $(jq -s length /tmp/dup-1-objects.json) objects unchanged"
 
 kubectl get backupconfigs.cnpg-extensions.yandex.cloud -A -o wide || true
 
