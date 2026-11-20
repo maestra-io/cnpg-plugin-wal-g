@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -257,6 +258,13 @@ func (r *BackupReconciler) reconcileBackupPermanence(ctx context.Context, backup
 
 	if needsBackupMark(backup) {
 		err = walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion).MarkBackupPermanent(ctx, backup.Status.BackupID)
+		if errors.Is(err, walg.ErrBackupNotInStorage) {
+			// Written to a storage the BackupConfig no longer points at (an older prefix):
+			// nothing to mark there, and a requeue would retry it forever.
+			logger.Info("Backup is not in the storage of its BackupConfig, not marking it permanent",
+				"backupID", backup.Status.BackupID)
+			err = nil
+		}
 	}
 
 	// We do NOT unmark backups as inpermanent - it will be done during backup deletion operation

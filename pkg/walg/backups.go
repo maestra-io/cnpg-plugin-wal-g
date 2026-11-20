@@ -214,6 +214,10 @@ func (c *Client) MarkBackupPermanent(ctx context.Context, backupName string) err
 		WithEnv(c.config.ToEnvMap()).
 		Run()
 
+	if err != nil && IsBackupNotInStorage(result.Stderr(), backupName) {
+		logger.Info(fmt.Sprintf("Backup %s is not in the storage, 'wal-g backup-mark' skipped", backupName))
+		return ErrBackupNotInStorage
+	}
 	if err != nil {
 		logger.Error(
 			err, fmt.Sprintf("Error while 'wal-g backup-mark %s'", backupName),
@@ -336,6 +340,19 @@ var ErrRetainedByLock = errors.New("retained by bucket lock")
 func IsRetainedByLock(stderr []byte) bool {
 	return bytes.Contains(stderr, []byte("retained by bucket lock")) ||
 		bytes.Contains(stderr, []byte("ObjectLockedByBucketPolicy"))
+}
+
+// ErrBackupNotInStorage: the backup's metadata is not in the storage the client points
+// at. A Backup written before its BackupConfig moved to another prefix (the plain archive
+// left behind when encryption moved it to walg-enc/) stays there; retrying cannot find it.
+var ErrBackupNotInStorage = errors.New("backup is not in the storage")
+
+// IsBackupNotInStorage reports whether a failed wal-g run (its stderr) could not find the
+// metadata of backupName itself. A missing metadata of another backup (the base of a
+// delta) names that backup and does not match.
+func IsBackupNotInStorage(stderr []byte, backupName string) bool {
+	return backupName != "" &&
+		bytes.Contains(stderr, []byte("/"+backupName+"/metadata.json' not found in storage"))
 }
 
 // ErrStorageGone: the bucket itself does not exist (S3 error code NoSuchBucket), so
