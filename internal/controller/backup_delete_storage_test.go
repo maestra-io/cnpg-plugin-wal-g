@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,10 +15,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1beta1 "github.com/wal-g/cnpg-plugin-wal-g/api/v1beta1"
+	"github.com/wal-g/cnpg-plugin-wal-g/internal/common"
 	"github.com/wal-g/cnpg-plugin-wal-g/internal/util/cmd"
 )
 
@@ -173,9 +176,9 @@ func TestDeleteWALGBackup_GivesUpOnlyWhenGoneOrAsked(t *testing.T) {
 			"api error NoSuchBucket: The specified bucket does not exist.", withConfig: true, walgCalled: true},
 		"backup already deleted (storage answered, stale StorageWritable False)": {
 			answer: "0|", withConfig: true, walgCalled: true},
-		"BackupConfig gone":               {answer: "1|must not run", withConfig: false},
-		"skip annotation on Backup":       {answer: "1|must not run", backupAnnotations: skip, withConfig: true},
-		"skip annotation on BackupConfig": {answer: "1|must not run", configAnnotations: skip, withConfig: true},
+		"BackupConfig gone, skip annotation on Backup": {answer: "1|must not run", backupAnnotations: skip, withConfig: false},
+		"skip annotation on Backup":                    {answer: "1|must not run", backupAnnotations: skip, withConfig: true},
+		"skip annotation on BackupConfig":              {answer: "1|must not run", configAnnotations: skip, withConfig: true},
 		"skip annotation not \"true\"": {answer: "0|", withConfig: true, walgCalled: true,
 			backupAnnotations: map[string]string{v1beta1.SkipStorageCleanupAnnotationName: "false"}},
 	}
@@ -194,6 +197,151 @@ func TestDeleteWALGBackup_GivesUpOnlyWhenGoneOrAsked(t *testing.T) {
 				t.Errorf("wal-g delete target called = %v, want %v", called(), tc.walgCalled)
 			}
 		})
+	}
+}
+
+// A BackupConfig deleted before its Backups (namespace teardown, chart refactor, rename)
+// left their data in the bucket, invisible to retention: the finalizer was released
+// without storage cleanup. Both entry points must keep it now.
+func TestBackupConfigGoneKeepsFinalizer(t *testing.T) {
+	for name, run := range map[string]func(*BackupDeletionController, client.Client) error{
+		"deleteWALGBackup": func(ctrl *BackupDeletionController, _ client.Client) error {
+			return ctrl.deleteWALGBackup(context.Background(), client.ObjectKey{Namespace: "ns", Name: "b"})
+		},
+		"EnqueueBackupDeletion": func(ctrl *BackupDeletionController, c client.Client) error {
+			b := &cnpgv1.Backup{}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "b"}, b); err != nil {
+				return err
+			}
+			return ctrl.EnqueueBackupDeletion(context.Background(), b)
+		},
+	} {
+		for _, recreated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s recreated=%v", name, recreated), func(t *testing.T) {
+				backupConfigGoneKeepsFinalizer(t, run, recreated)
+			})
+		}
+	}
+}
+
+// backupConfigGoneKeepsFinalizer runs one entry point on a Backup whose BackupConfig is
+// gone, or re-created under the same name (another UID: it must not delete the data).
+func backupConfigGoneKeepsFinalizer(t *testing.T, run func(*BackupDeletionController, client.Client) error, recreated bool) {
+	called := fakeWalgOnPath(t, "1|must not run")
+	ctrl, c := deletingBackup(t, nil, nil, recreated)
+	if recreated {
+		b := &cnpgv1.Backup{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "b"}, b); err != nil {
+			t.Fatal(err)
+		}
+		b.OwnerReferences[0].UID = "uid-of-the-deleted-backupconfig"
+		if err := c.Update(context.Background(), b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := run(ctrl, c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	kept, annotations := finalizerKept(t, c)
+	if !kept {
+		t.Fatal("the finalizer was removed while the backup is still in storage: orphaned backup")
+	}
+	if _, ok := annotations[v1beta1.BackupDeletionFailingAnnotationName]; !ok {
+		t.Errorf("the Backup must be marked %s, got %v", v1beta1.BackupDeletionFailingAnnotationName, annotations)
+	}
+	if called() {
+		t.Error("wal-g must not run without a BackupConfig")
+	}
+}
+
+// The Backup reconciler stopped before the deletion controller: reconcileRelatedBackupsMetadata
+// failed on the missing BackupConfig and the reconcile errored forever, with no mark, no
+// condition, and the skip-storage-cleanup annotation never read (seen on omicron with
+// v0.3.0-maestra.11, 20.11.2026).
+func TestReconcileBackupConfigGone(t *testing.T) {
+	for name, tc := range map[string]struct {
+		annotations map[string]string
+		kept        bool
+	}{
+		"kept and marked":         {kept: true},
+		"released when annotated": {annotations: map[string]string{v1beta1.SkipStorageCleanupAnnotationName: "true"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fakeWalgOnPath(t, "1|must not run")
+			dc, c := deletingBackup(t, tc.annotations, nil, false)
+			b := &cnpgv1.Backup{}
+			key := client.ObjectKey{Namespace: "ns", Name: "b"}
+			if err := c.Get(context.Background(), key, b); err != nil {
+				t.Fatal(err)
+			}
+			b.Spec.Cluster.Name = "pg"
+			b.Spec.Method = cnpgv1.BackupMethodPlugin
+			b.Spec.PluginConfiguration = &cnpgv1.BackupPluginConfiguration{Name: common.PluginNameDeprecated}
+			if err := c.Update(context.Background(), b); err != nil {
+				t.Fatal(err)
+			}
+			r := &BackupReconciler{Client: c, Scheme: c.Scheme(), DeletionController: dc}
+
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatalf("the reconcile must not fail on a missing BackupConfig: %v", err)
+			}
+			kept, annotations := finalizerKept(t, c)
+			if kept != tc.kept {
+				t.Fatalf("finalizer kept = %v, want %v", kept, tc.kept)
+			}
+			if _, marked := annotations[v1beta1.BackupDeletionFailingAnnotationName]; kept && !marked {
+				t.Errorf("the Backup must be marked %s, got %v", v1beta1.BackupDeletionFailingAnnotationName, annotations)
+			}
+		})
+	}
+}
+
+func TestBackupConfigGoneWithoutPhysicalBackupReleasesFinalizer(t *testing.T) {
+	ctrl, c := deletingBackup(t, nil, nil, false)
+	b := &cnpgv1.Backup{}
+	key := client.ObjectKey{Namespace: "ns", Name: "b"}
+	if err := c.Get(context.Background(), key, b); err != nil {
+		t.Fatal(err)
+	}
+	b.Status.BackupID = ""
+	if err := c.Update(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrl.EnqueueBackupDeletion(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	if kept, _ := finalizerKept(t, c); kept {
+		t.Error("a Backup with no data in storage must not wait for its BackupConfig")
+	}
+}
+
+// Nothing reported a Backup whose BackupConfig is gone: the condition lives on a
+// BackupConfig. Another BackupConfig of the namespace (a rename) carries it now.
+func TestStatusReportsBackupsOfGoneBackupConfig(t *testing.T) {
+	fakeWalgOnPath(t, "0|")
+	_, c := deletingBackup(t, map[string]string{v1beta1.BackupDeletionFailingAnnotationName: "2026-11-20T12:00:00Z"}, nil, false)
+	renamed, secret := createTestBackupConfig("bc-renamed", "ns")
+	for _, obj := range []client.Object{secret, renamed} {
+		if err := c.Create(context.Background(), obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := NewBackupConfigStatusController(c, time.Hour, 2*time.Second)
+	status.storageCheckRetryBackoff = 0
+
+	key := client.ObjectKey{Namespace: "ns", Name: "bc-renamed"}
+	if err := status.reconcileStatusByKey(context.Background(), key, logr.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	bc := &v1beta1.BackupConfig{}
+	if err := c.Get(context.Background(), key, bc); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(bc.Status.Conditions, v1beta1.ConditionTypeBackupDeletionFailing)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "BackupConfigNotFound" ||
+		!strings.Contains(cond.Message, ": b") {
+		t.Errorf("want BackupDeletionFailing True, reason BackupConfigNotFound, naming b; got %+v", cond)
 	}
 }
 

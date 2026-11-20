@@ -596,7 +596,8 @@ func (c *BackupConfigStatusController) reconcileBackupTimestamps(
 		}
 	}
 
-	reconcileRetainedDeletions(backupConfig, relevantBackups)
+	reconcileRetainedDeletions(backupConfig, relevantBackups,
+		c.backupsOfGoneConfigs(ctx, backupConfig.Namespace, backupList.Items, logger))
 
 	if len(relevantBackups) == 0 {
 		return
@@ -806,17 +807,60 @@ func getConditionStatus(backupConfig *v1beta1.BackupConfig, conditionType string
 // lock (BackupRetainedByLockAnnotationName), and ConditionTypeBackupDeletionFailing while
 // any deletion fails otherwise (BackupDeletionFailingAnnotationName). Each condition is
 // removed when no Backup is in that state.
-func reconcileRetainedDeletions(backupConfig *v1beta1.BackupConfig, backups []cnpgv1.Backup) {
+//
+// orphans are the namespace's Backups whose own BackupConfig is gone (backupsOfGoneConfigs):
+// their deletion cannot run and nothing else reports it, so every BackupConfig of the
+// namespace carries them in BackupDeletionFailing with reason BackupConfigNotFound.
+func reconcileRetainedDeletions(backupConfig *v1beta1.BackupConfig, backups, orphans []cnpgv1.Backup) {
 	reconcileDeletionCondition(backupConfig, backups, v1beta1.BackupRetainedByLockAnnotationName,
 		v1beta1.ConditionTypeBackupDeletionRetainedByLock, "RetainedByBucketLock",
 		"Backup(s) kept in storage by the bucket lock, deletion retried")
+	orphaned := lo.SliceToMap(orphans, func(b cnpgv1.Backup) (string, bool) { return b.Name, true })
+	backups = lo.Reject(backups, func(b cnpgv1.Backup, _ int) bool { return orphaned[b.Name] })
 	reconcileDeletionCondition(backupConfig, backups, v1beta1.BackupDeletionFailingAnnotationName,
 		v1beta1.ConditionTypeBackupDeletionFailing, "DeletionFailing",
 		"Backup(s) could not be deleted from storage (unreachable or refused), finalizer kept, deletion retried")
+	if names := deletingMarked(orphans, v1beta1.BackupDeletionFailingAnnotationName); len(names) > 0 {
+		message := fmt.Sprintf("%d Backup(s) whose BackupConfig is gone, still in storage, finalizer kept "+
+			"until the Backup is annotated %s: %s",
+			len(names), v1beta1.SkipStorageCleanupAnnotationName, strings.Join(names, ", "))
+		if cond := meta.FindStatusCondition(backupConfig.Status.Conditions,
+			v1beta1.ConditionTypeBackupDeletionFailing); cond != nil {
+			message = cond.Message + "; " + message
+		}
+		setCondition(backupConfig, v1beta1.ConditionTypeBackupDeletionFailing, metav1.ConditionTrue,
+			"BackupConfigNotFound", message)
+	}
+}
+
+// backupsOfGoneConfigs returns the Backups owned by a BackupConfig that no longer exists.
+func (c *BackupConfigStatusController) backupsOfGoneConfigs(ctx context.Context, namespace string,
+	backups []cnpgv1.Backup, logger logr.Logger) []cnpgv1.Backup {
+	configs := &v1beta1.BackupConfigList{}
+	if err := c.client.List(ctx, configs, client.InNamespace(namespace)); err != nil {
+		logger.Error(err, "Failed to list BackupConfigs")
+		return nil
+	}
+	uids := lo.SliceToMap(configs.Items, func(bc v1beta1.BackupConfig) (string, types.UID) { return bc.Name, bc.UID })
+	return lo.Filter(backups, func(b cnpgv1.Backup, _ int) bool {
+		ref, owned := lo.Find(b.OwnerReferences, func(ref metav1.OwnerReference) bool { return ref.Kind == "BackupConfig" })
+		return owned && uids[ref.Name] != ref.UID // gone, or re-created as another object
+	})
 }
 
 func reconcileDeletionCondition(backupConfig *v1beta1.BackupConfig, backups []cnpgv1.Backup,
 	annotation, conditionType, reason, what string) {
+	names := deletingMarked(backups, annotation)
+	if len(names) == 0 {
+		meta.RemoveStatusCondition(&backupConfig.Status.Conditions, conditionType)
+		return
+	}
+	setCondition(backupConfig, conditionType, metav1.ConditionTrue, reason,
+		fmt.Sprintf("%d %s: %s", len(names), what, strings.Join(names, ", ")))
+}
+
+// deletingMarked returns the sorted names of the Backups being deleted that carry annotation.
+func deletingMarked(backups []cnpgv1.Backup, annotation string) []string {
 	names := make([]string, 0)
 	for i := range backups {
 		_, marked := backups[i].Annotations[annotation]
@@ -824,11 +868,6 @@ func reconcileDeletionCondition(backupConfig *v1beta1.BackupConfig, backups []cn
 			names = append(names, backups[i].Name)
 		}
 	}
-	if len(names) == 0 {
-		meta.RemoveStatusCondition(&backupConfig.Status.Conditions, conditionType)
-		return
-	}
 	sort.Strings(names)
-	setCondition(backupConfig, conditionType, metav1.ConditionTrue, reason,
-		fmt.Sprintf("%d %s: %s", len(names), what, strings.Join(names, ", ")))
+	return names
 }
