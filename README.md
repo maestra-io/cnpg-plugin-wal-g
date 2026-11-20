@@ -81,6 +81,26 @@ So that a storage latency blip does not flip them to `False` while WAL archiving
 A storage that fails both attempts gives the same result as before: the condition is
 `False`, with the last error as its message, and the metric is `0`.
 
+## Backup names
+
+wal-g names a backup after the WAL segment it starts in (`base_<segment>`). A standby
+starts a backup at its last restart point, which moves only with a checkpoint of the
+primary: two Backups from a standby whose restart point is still in the same segment (an
+idle database, no checkpoint or only a small write between them) get the same name. The
+second one fails right after `pg_backup_start`, before it uploads anything, with
+`backup base_<segment> already exists in storage`; the first one stays as it was. Before
+`-maestra.2` of the bundled wal-g it overwrote the first one (under an R2 bucket lock:
+added objects to it until a PutObject was refused). The first backup plus the archived WAL
+covers everything since it; a Backup succeeds once the standby's restart point is in a
+later segment. A checkpoint alone can stay in the same segment: to start one now, run
+`SELECT pg_switch_wal(); CHECKPOINT;` on the primary and retry once the standby has
+replayed both.
+
+The same error with `as the objects of an unfinished backup` means the folder holds objects
+but no sentinel: an earlier backup-push that started in that segment failed. Those objects
+are not a backup. Remove them where the bucket lock allows it, or move to a new segment as
+above.
+
 ## Deleting backups
 
 A deleted `Backup` keeps the finalizer `cnpg-plugin-wal-g.yandex.cloud/backup-cleanup` until

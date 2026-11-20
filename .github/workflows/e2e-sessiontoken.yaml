@@ -25,6 +25,7 @@ on:
       - 'pkg/**'
       - 'chart/**'
       - 'hack/e2e/**'
+      - 'hack/wal-g/**'
       - '.github/workflows/e2e-sessiontoken.yaml'
 
 permissions:

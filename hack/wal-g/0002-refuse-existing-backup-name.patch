@@ -1,0 +1,131 @@
+From f1051f12f512b0afda09e19aba9d48426cd61117 Mon Sep 17 00:00:00 2001
+From: cnpg-plugin-wal-g <noreply@maestra.io>
+Date: Fri, 20 Nov 2026 18:34:29 +0000
+Subject: [PATCH] postgres: refuse a backup name the storage already holds
+
+A backup is named after the WAL segment it starts in, and a standby starts
+at its last restart point. With no checkpoint on the primary since the
+previous backup (an idle database), the next backup taken from a standby
+gets the same name and overwrites it; under an R2 bucket lock it adds
+objects to it until a PutObject is refused. backup-push now checks, right
+after pg_backup_start and before any upload, that neither the sentinel nor
+any object under the backup's folder exists, and fails otherwise.
+
+issues-maestra#1786
+---
+ .../postgres/backup_name_taken_test.go        | 51 +++++++++++++++++++
+ .../databases/postgres/backup_push_handler.go | 33 ++++++++++++
+ 2 files changed, 84 insertions(+)
+ create mode 100644 internal/databases/postgres/backup_name_taken_test.go
+
+diff --git a/internal/databases/postgres/backup_name_taken_test.go b/internal/databases/postgres/backup_name_taken_test.go
+new file mode 100644
+index 0000000..2ed4cfd
+--- /dev/null
++++ b/internal/databases/postgres/backup_name_taken_test.go
+@@ -0,0 +1,51 @@
++package postgres
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/wal-g/wal-g/pkg/storages/memory"
++	"github.com/wal-g/wal-g/utility"
++)
++
++// A standby starts a backup at its last restart point, so two backups with no checkpoint
++// on the primary between them get the same name. The second must stop before it writes
++// anything into the first one's objects (issues-maestra#1786, omega db-coder 20.11.2026).
++func TestAssureBackupNameFree(t *testing.T) {
++	const name = "base_0000000A0000005300000062"
++	put := func(t *testing.T, folder *memory.Folder, path string) {
++		require.NoError(t, folder.PutObject(t.Context(), path, bytes.NewBufferString("x")))
++	}
++
++	t.Run("free", func(t *testing.T) {
++		folder := memory.NewFolder("basebackups_005/", memory.NewKVS())
++		put(t, folder, "base_0000000A0000005300000061"+utility.SentinelSuffix)
++		put(t, folder, "base_0000000A0000005300000061/tar_partitions/part_001.tar.br")
++		assert.NoError(t, assureBackupNameFree(t.Context(), folder, name))
++	})
++	t.Run("finished backup", func(t *testing.T) {
++		folder := memory.NewFolder("basebackups_005/", memory.NewKVS())
++		put(t, folder, name+utility.SentinelSuffix)
++		put(t, folder, name+"/tar_partitions/part_001.tar.br")
++		err := assureBackupNameFree(t.Context(), folder, name)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), name+" already exists in storage: the backup starts in the same WAL segment")
++	})
++	t.Run("objects of an unfinished backup", func(t *testing.T) {
++		folder := memory.NewFolder("basebackups_005/", memory.NewKVS())
++		put(t, folder, name+"/tar_partitions/part_003.tar.br")
++		err := assureBackupNameFree(t.Context(), folder, name)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), name+" already exists in storage as the objects of an unfinished backup")
++	})
++	t.Run("only metadata", func(t *testing.T) {
++		folder := memory.NewFolder("basebackups_005/", memory.NewKVS())
++		put(t, folder, name+"/"+utility.MetadataFileName)
++		err := assureBackupNameFree(t.Context(), folder, name)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "unfinished backup")
++	})
++}
+diff --git a/internal/databases/postgres/backup_push_handler.go b/internal/databases/postgres/backup_push_handler.go
+index f13c9d7..d95d951 100644
+--- a/internal/databases/postgres/backup_push_handler.go
++++ b/internal/databases/postgres/backup_push_handler.go
+@@ -206,6 +206,9 @@ func (bh *BackupHandler) createAndPushBackup(ctx context.Context) {
+ 	}
+ 	err = bh.handleDeltaBackup(ctx, folder)
+ 	tracelog.ErrorLogger.FatalOnError(err)
++	// After handleDeltaBackup: a delta backup's name gets its _D_<base> suffix there.
++	err = assureBackupNameFree(ctx, bh.Arguments.Uploader.Folder(), bh.CurBackupInfo.Name)
++	tracelog.ErrorLogger.FatalOnError(err)
+ 	tarFileSets := bh.uploadBackup(ctx)
+ 	sentinelDto, filesMetaDto, err := bh.setupDTO(ctx, tarFileSets)
+ 	tracelog.ErrorLogger.FatalOnError(err)
+@@ -274,6 +277,36 @@ func (bh *BackupHandler) startBackup(ctx context.Context) error {
+ 	return nil
+ }
+ 
++// assureBackupNameFree refuses a backup name that the storage already holds: its sentinel
++// or any object under its folder. A backup is named after the WAL segment it starts in,
++// and a standby starts at its last restart point, so while that point stays in the segment
++// the previous backup started in, the next one gets the same name and would overwrite it
++// (under an R2 bucket lock: add objects to it). It runs before anything is uploaded,
++// on the final name (a delta backup's included).
++func assureBackupNameFree(ctx context.Context, folder storage.Folder, name string) error {
++	sentinel, err := folder.Exists(ctx, name+utility.SentinelSuffix)
++	if err != nil {
++		return errors.Wrapf(err, "failed to check whether backup %s exists", name)
++	}
++	objects, subFolders, err := folder.GetSubFolder(name).ListFolder(ctx)
++	if err != nil {
++		return errors.Wrapf(err, "failed to check whether backup %s exists", name)
++	}
++	if sentinel {
++		return fmt.Errorf("backup %s already exists in storage: the backup starts in the same WAL segment "+
++			"(a standby whose restart point has not left that segment since, e.g. an idle database); "+
++			"not writing into it; to start a new one, run pg_switch_wal() and then CHECKPOINT on the primary, "+
++			"and retry once the standby has replayed them", name)
++	}
++	if len(objects) > 0 || len(subFolders) > 0 {
++		return fmt.Errorf("backup %s already exists in storage as the objects of an unfinished backup "+
++			"(no sentinel: an earlier backup-push that started in the same WAL segment failed); "+
++			"not writing into it; remove them where the storage allows it, or run pg_switch_wal() and then "+
++			"CHECKPOINT on the primary, and retry once the standby has replayed them", name)
++	}
++	return nil
++}
++
+ func (bh *BackupHandler) initQueryRunner(ctx context.Context) error {
+ 	if bh.Workers.QueryRunner != nil {
+ 		return nil
+-- 
+2.54.0 (Apple Git-157)
+

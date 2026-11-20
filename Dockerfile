@@ -19,7 +19,7 @@ ARG WALG_REPO=https://github.com/wal-g/wal-g
 ARG WALG_COMMIT=ebd2e83f8e39b5997c7694616af14f68f05a3223
 # Stamped into `wal-g --version` (the Makefile reads it from the environment); the
 # suffix counts our patches below.
-ARG WALG_VERSION=v3.0.9-185-gebd2e83f-maestra.1
+ARG WALG_VERSION=v3.0.9-185-gebd2e83f-maestra.2
 
 # build arguments for wal-g
 ARG USE_BROTLI=1
@@ -38,7 +38,8 @@ RUN git init -q $(go env GOPATH)/src/github.com/wal-g/wal-g && \
 
 # Our wal-g patches (hack/wal-g/*.patch, applied in name order, the build fails if one
 # does not apply): 0001 makes an R2 bucket lock refusal final and reads the per-key
-# errors of DeleteObjects (issues-maestra#1786).
+# errors of DeleteObjects; 0002 refuses a backup name the storage already holds (an
+# idle database backed up from a standby twice) before writing anything (issues-maestra#1786).
 COPY hack/wal-g/ /wal-g-patches/
 RUN cd $(go env GOPATH)/src/github.com/wal-g/wal-g && \
     git -c user.name=build -c user.email=build@localhost am -q /wal-g-patches/*.patch
