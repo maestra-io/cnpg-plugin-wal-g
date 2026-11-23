@@ -75,3 +75,18 @@ var _ = Describe("Client.StorageCheckWritable", func() {
 		Expect(time.Since(start)).To(BeNumerically("<", 30*time.Second))
 	})
 })
+
+var _ = Describe("parseStorageLsFolders", func() {
+	It("returns the folder names of a `wal-g st ls` listing", func() {
+		output := "type size last modified                  name\n" +
+			"dir  0    0001-01-01 00:00:00 +0000 UTC 16/  \n" +
+			"dir  0    0001-01-01 00:00:00 +0000 UTC 17/  \n" +
+			"dir  0    0001-01-01 00:00:00 +0000 UTC storage-check/  \n" +
+			"obj  42   2026-11-23 18:00:00 +0000 UTC stray.json  \n"
+		Expect(parseStorageLsFolders([]byte(output))).To(Equal([]string{"16", "17", "storage-check"}))
+	})
+
+	It("returns no folder for an empty prefix", func() {
+		Expect(parseStorageLsFolders([]byte("type size last modified name\n"))).To(BeEmpty())
+	})
+})

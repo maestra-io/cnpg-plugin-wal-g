@@ -181,6 +181,34 @@ func (c *Client) StorageLsTotalSize(ctx context.Context, path string) (int64, er
 	return parseStorageLsOutput(result.Stdout())
 }
 
+// StorageLsFolders runs `wal-g st ls` on the storage root (one delimiter LIST) and
+// returns the names of its subfolders, without the trailing slash.
+func (c *Client) StorageLsFolders(ctx context.Context) ([]string, error) {
+	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	result, err := cmd.New("wal-g", "st", "ls").
+		WithContext(commandCtx).
+		WithEnv(c.config.ToEnvMap()).
+		Run()
+	if err != nil {
+		return nil, fmt.Errorf("wal-g st ls: %w: %s", err, result.Stderr())
+	}
+	return parseStorageLsFolders(result.Stdout()), nil
+}
+
+// parseStorageLsFolders returns the folder names of `wal-g st ls` output, whose
+// folder lines are "dir  0 0001-01-01 00:00:00 +0000 UTC <name>/".
+func parseStorageLsFolders(output []byte) []string {
+	var folders []string
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "dir" {
+			folders = append(folders, strings.TrimSuffix(fields[len(fields)-1], "/"))
+		}
+	}
+	return folders
+}
+
 // parseStorageLsOutput parses the output of `wal-g st ls` and sums up file sizes.
 // Each line has the format: "obj  <size> <date> <time> <timezone> <filename>"
 // Example: "obj  5327891 2026-04-27 12:18:55.841 +0000 UTC 000000020000000A00000034.br"
