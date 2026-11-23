@@ -416,7 +416,8 @@ func (b *BackupDeletionController) bucketLockAge(ctx context.Context, namespace,
 	if err := reader.List(ctx, locks, client.InNamespace(namespace)); err != nil {
 		return 0, fmt.Errorf("listing R2BucketLocks: %w", err)
 	}
-	keyPath := strings.TrimPrefix(location.Path, "/")
+	// every object key of the storage starts with this
+	storageKeys := strings.Trim(location.Path, "/") + "/"
 	var days int64
 	for _, lock := range locks.Items {
 		if bucket, _, _ := unstructured.NestedString(lock.Object, "spec", "forProvider", "bucketName"); bucket != location.Host {
@@ -428,10 +429,13 @@ func (b *BackupDeletionController) bucketLockAge(ctx context.Context, namespace,
 			if enabled, _, _ := unstructured.NestedBool(rule, "enabled"); !enabled {
 				continue
 			}
-			// a rule covers the keys under its prefix (all keys without one): it applies
-			// when it covers the storage, or a part of it
-			if prefix, _, _ := unstructured.NestedString(rule, "prefix"); !strings.HasPrefix(keyPath, prefix) &&
-				!strings.HasPrefix(prefix, keyPath) {
+			// a rule covers the keys under its prefix (all keys without one); one covering
+			// only a part of the storage may or may not cover this backup: no schedule
+			prefix, _, _ := unstructured.NestedString(rule, "prefix")
+			if strings.HasPrefix(prefix, storageKeys) && prefix != storageKeys {
+				return 0, fmt.Errorf("R2BucketLock %s has a rule for a part of the storage (%s)", lock.GetName(), prefix)
+			}
+			if !strings.HasPrefix(storageKeys, prefix) {
 				continue
 			}
 			condition, _, _ := unstructured.NestedMap(rule, "condition")
@@ -461,10 +465,12 @@ func storagePrefix(backupConfig *v1beta1.BackupConfigWithSecrets) string {
 
 // waitForLockExpiry returns how long a deletion refused by the bucket lock still waits for
 // the recorded lock expiry (BackupRetainedUntilAnnotationName), if it is in the future.
-// A Backup annotated to skip the storage cleanup does not wait: it is released now.
-func waitForLockExpiry(backup *cnpgv1.Backup, now time.Time) (time.Duration, bool) {
+// A Backup annotated to skip the storage cleanup, or whose BackupConfig (nil when not
+// found) is, does not wait: it is released now.
+func waitForLockExpiry(backup *cnpgv1.Backup, backupConfig *v1beta1.BackupConfig, now time.Time) (time.Duration, bool) {
 	until, err := time.Parse(time.RFC3339, backup.Annotations[v1beta1.BackupRetainedUntilAnnotationName])
-	if err != nil || !until.After(now) || skipStorageCleanup(backup) {
+	if err != nil || !until.After(now) || skipStorageCleanup(backup) ||
+		(backupConfig != nil && skipStorageCleanup(backupConfig)) {
 		return 0, false
 	}
 	return until.Sub(now), true

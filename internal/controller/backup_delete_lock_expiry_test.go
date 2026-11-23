@@ -132,6 +132,8 @@ func TestDeleteWALGBackup_LockRefusalWithoutAKnownLockAgeBacksOff(t *testing.T) 
 		"no R2BucketLock":      nil,
 		"another bucket":       {r2BucketLock("other-bucket", ageRule(28))},
 		"not an age condition": {r2BucketLock("test-bucket", ageRule(28), map[string]any{"enabled": true, "condition": map[string]any{"date": "2027-01-01"}})},
+		"a rule for a part of the storage": {r2BucketLock("test-bucket", ageRule(28), map[string]any{
+			"enabled": true, "prefix": "test-prefix/archive/", "condition": map[string]any{"ageDays": int64(2190)}})},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dc, c := writableStorageBackup(t, locks...)
@@ -152,7 +154,7 @@ func TestWaitForLockExpiry(t *testing.T) {
 	} {
 		backup := &cnpgv1.Backup{}
 		backup.Annotations = map[string]string{v1beta1.BackupRetainedUntilAnnotationName: until}
-		got, pending := waitForLockExpiry(backup, now)
+		got, pending := waitForLockExpiry(backup, nil, now)
 		if pending != (want > 0) || got != want {
 			t.Errorf("until %q: got %v, %v; want %v", until, got, pending, want)
 		}
@@ -164,7 +166,13 @@ func TestWaitForLockExpiry(t *testing.T) {
 		v1beta1.BackupRetainedUntilAnnotationName: "2026-12-19T08:10:01Z",
 		v1beta1.SkipStorageCleanupAnnotationName:  "true",
 	}
-	if _, pending := waitForLockExpiry(backup, now); pending {
+	if _, pending := waitForLockExpiry(backup, nil, now); pending {
 		t.Error("a Backup annotated to skip the storage cleanup must not wait for the lock")
+	}
+	delete(backup.Annotations, v1beta1.SkipStorageCleanupAnnotationName)
+	bc := &v1beta1.BackupConfig{}
+	bc.Annotations = map[string]string{v1beta1.SkipStorageCleanupAnnotationName: "true"}
+	if _, pending := waitForLockExpiry(backup, bc, now); pending {
+		t.Error("a BackupConfig annotated to skip the storage cleanup must release its Backups now")
 	}
 }

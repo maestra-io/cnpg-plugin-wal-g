@@ -109,7 +109,11 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 		// A bucket lock that releases the backup at a known time: nothing to try before it
 		// (also not on an operator restart or an unrelated event of the Backup).
-		if wait, pending := waitForLockExpiry(backup, time.Now()); pending {
+		backupConfig, err := v1beta1.GetBackupConfigForBackup(ctx, r.Client, backup)
+		if err != nil {
+			backupConfig = nil // gone or unreadable: the deletion controller handles that
+		}
+		if wait, pending := waitForLockExpiry(backup, backupConfig, time.Now()); pending {
 			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 
