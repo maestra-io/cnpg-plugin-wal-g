@@ -32,6 +32,11 @@ const BackupTypeIncremental BackupType = "incremental"
 // The finalizer stays and the deletion is retried until the lock age has passed.
 const BackupRetainedByLockAnnotationName = "cnpg-plugin-wal-g.yandex.cloud/retained-by-bucket-lock"
 
+// BackupRetainedUntilAnnotationName is set next to BackupRetainedByLockAnnotationName when
+// the lock age is known (the bucket's R2BucketLock): the time the lock releases the newest
+// object of the backup. The deletion is not retried before it.
+const BackupRetainedUntilAnnotationName = "cnpg-plugin-wal-g.yandex.cloud/retained-by-bucket-lock-until"
+
 // BackupDeletionFailingAnnotationName is set on a Backup being deleted while its deletion
 // from storage fails for any reason other than a bucket lock (storage unreachable, 403,
 // signature error, timeout, 5xx, missing credentials). The value is the time of the first

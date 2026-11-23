@@ -52,6 +52,7 @@ type BackupReconciler struct {
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=backups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=backups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=backups/finalizers,verbs=update
+// +kubebuilder:rbac:groups=r2.cloudflare.maestra.io,resources=r2bucketlocks,verbs=list
 
 const (
 	// BackupReconcileTimeout bounds one Backup reconcile, wal-g subprocesses included:
@@ -104,6 +105,16 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// and the skip-storage-cleanup annotation never got read.
 		if err := r.reconcileRelatedBackupsMetadata(ctx, backup); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
+		}
+
+		// A bucket lock that releases the backup at a known time: nothing to try before it
+		// (also not on an operator restart or an unrelated event of the Backup).
+		backupConfig, err := v1beta1.GetBackupConfigForBackup(ctx, r.Client, backup)
+		if err != nil {
+			backupConfig = nil // gone or unreadable: the deletion controller handles that
+		}
+		if wait, pending := waitForLockExpiry(backup, backupConfig, time.Now()); pending {
+			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 
 		// Handle backup deletion in background, because cleaning physical backup could take long time

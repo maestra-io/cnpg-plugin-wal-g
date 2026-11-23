@@ -151,6 +151,10 @@ func (c *Client) GetBackupsList(ctx context.Context) ([]BackupMetadata, error) {
 	logger.V(1).Info("Finished wal-g backup-list", "stdout", string(result.Stdout()), "stderr", string(result.Stderr()))
 
 	backupsMetadata := make([]BackupMetadata, 0)
+	if len(bytes.TrimSpace(result.Stdout())) == 0 {
+		// wal-g prints nothing on stdout (only "No backups found" on stderr) for an empty storage
+		return backupsMetadata, nil
+	}
 	if err = json.Unmarshal(result.Stdout(), &backupsMetadata); err != nil {
 		logger.Error(
 			err, "GetBackupsList: cannot unmarshal wal-g backup-list",
@@ -243,10 +247,12 @@ func (c *Client) unmarkBackupPermanent(ctx context.Context, backupName string) (
 		WithEnv(c.config.ToEnvMap()).
 		Run()
 
-	if err != nil {
+	// A bucket lock refusal and a backup missing from this storage are handled by the
+	// callers; logged here as errors they repeated on every retry of a locked backup.
+	if err != nil && !IsRetainedByLock(result.Stderr()) && !IsBackupNotInStorage(result.Stderr(), backupName) {
 		logger.Error(
 			err, fmt.Sprintf("Error while 'wal-g backup-mark -i %s'", backupName),
-			"stdout", result.Stdout(), "stderr", result.Stderr(),
+			"stdout", string(result.Stdout()), "stderr", string(result.Stderr()),
 		)
 	}
 	return result, err
@@ -257,10 +263,16 @@ func (c *Client) DeleteBackup(ctx context.Context, backupName string) (*cmd.RunR
 	logger := logr.FromContextOrDiscard(ctx)
 
 	// Errors on UnmarkBackupPermanent are ignored (try our best to remove the backup),
-	// except a bucket lock refusal: the backup is younger than the lock and cannot go.
-	if unmarkResult, unmarkErr := c.unmarkBackupPermanent(ctx, backupName); unmarkErr != nil &&
-		IsRetainedByLock(unmarkResult.Stderr()) {
-		return unmarkResult, ErrRetainedByLock
+	// except a bucket lock refusal (the backup is younger than the lock and cannot go) and
+	// a backup this storage does not hold: "delete target" would only answer "does not
+	// exist" (the plain archive a switch to walg-enc/ left behind holds it).
+	if unmarkResult, unmarkErr := c.unmarkBackupPermanent(ctx, backupName); unmarkErr != nil {
+		switch {
+		case IsRetainedByLock(unmarkResult.Stderr()):
+			return unmarkResult, ErrRetainedByLock
+		case IsBackupNotInStorage(unmarkResult.Stderr(), backupName):
+			return unmarkResult, ErrBackupNotInStorage
+		}
 	}
 
 	result, err := cmd.New("wal-g", "delete", "target", backupName, "--confirm").

@@ -119,6 +119,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - r2.cloudflare.maestra.io
+  resources:
+  - r2bucketlocks
+  verbs:
+  - list
+- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - rolebindings

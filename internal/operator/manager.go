@@ -35,6 +35,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -164,6 +165,11 @@ func Start(ctx context.Context) error {
 		HealthProbeBindAddress: viper.GetString("health-probe-bind-address"),
 		LeaderElection:         viper.GetBool("leader-elect"),
 		LeaderElectionID:       "f522231e.cnpg-extensions.yandex.cloud",
+		// The defaults (15s lease, 10s renew deadline) lost the lease on every etcd
+		// defrag pass, which stalls the apiserver's etcd member for 9-11s, and restarted
+		// the whole operator daily (omega 21-23.11.2026, issues-maestra#1786).
+		LeaseDuration: ptr.To(60 * time.Second),
+		RenewDeadline: ptr.To(40 * time.Second),
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -187,6 +193,8 @@ func Start(ctx context.Context) error {
 	}
 
 	backupDeletionController := controller.NewBackupDeletionController(mgr.GetClient())
+	// uncached: R2BucketLocks are read once per lock refusal, no informer for them
+	backupDeletionController.APIReader = mgr.GetAPIReader()
 	if err := mgr.Add(backupDeletionController); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupDeletionController")
 		return err

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,8 @@ import (
 	"golang.org/x/sync/semaphore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,6 +59,12 @@ type BackupDeletionController struct {
 	queueMX           sync.Mutex
 	queueCtxCancels   map[string]context.CancelFunc // Cancel functions for queue processing goroutines contexts
 	deletionSemaphore *semaphore.Weighted
+	// APIReader reads the R2BucketLocks (uncached); nil reads them through the Client.
+	APIReader client.Reader
+	// logger is the base logger of the queue goroutines. Not the logger of the request
+	// that starts a queue: that one carries its reconcile's Backup name and reconcileID,
+	// which then labeled every later deletion of the queue.
+	logger logr.Logger
 }
 
 // NewBackupDeletionController creates a new BackupDeletionController
@@ -65,6 +75,7 @@ func NewBackupDeletionController(client client.Client) *BackupDeletionController
 		deletionQueues:    make(map[string]chan DeletionRequest),
 		queueCtxCancels:   map[string]context.CancelFunc{},
 		deletionSemaphore: deletionSemaphore,
+		logger:            ctrl.Log.WithName("BackupDeletionController"),
 	}
 }
 
@@ -167,7 +178,8 @@ func (b *BackupDeletionController) enqueueDeletionRequest(
 		b.deletionQueues[queueKey] = make(chan DeletionRequest, 128)
 
 		// Create a derived context for this queue's processing goroutine
-		queueCtx, cancelFunc := context.WithCancel(logr.NewContext(context.Background(), logger))
+		queueCtx, cancelFunc := context.WithCancel(
+			logr.NewContext(context.Background(), b.logger.WithValues("queue", queueKey)))
 
 		b.queueCtxCancels[queueKey] = cancelFunc
 
@@ -200,15 +212,15 @@ func (b *BackupDeletionController) processDeletionQueue(
 			logger.Info("Stopping deletion queue processor")
 			return
 		case request := <-b.deletionQueues[queueKey]:
-			logger.Info("Processing deletion request", "type", request.Type, "key", request.Key)
+			requestLogger := logger.WithValues("type", request.Type, "backup", request.Key.String())
+			requestLogger.Info("Processing deletion request")
 
-			ctxWithTimeout, cancel := context.WithTimeout(ctx, DeletionRequestTimeout)
-			defer cancel() // releases timeout resources if deletion completes before timeout elapses
+			// cancel() at the end of the iteration: a defer in this endless loop never ran
+			ctxWithTimeout, cancel := context.WithTimeout(logr.NewContext(ctx, requestLogger), DeletionRequestTimeout)
 
 			var err error
 			switch request.Type {
 			case ResourceTypeBackup:
-				logger.Info("Dequeued wal-g backup for deletion", "backup", request.Key)
 				err = b.deleteWALGBackup(ctxWithTimeout, request.Key)
 			case ResourceTypeBackupConfig:
 				err = b.deleteBackupConfig(ctxWithTimeout, request.Key)
@@ -216,13 +228,14 @@ func (b *BackupDeletionController) processDeletionQueue(
 				err = fmt.Errorf("unknown resource type: %s", request.Type)
 			}
 
+			cancel()
+
 			switch {
 			case errors.Is(err, walg.ErrRetainedByLock):
 				// Not a failure: storage keeps the backup until it is older than the lock age.
-				logger.Info("Deletion refused by the bucket lock, the resource keeps its finalizer and is retried",
-					"type", request.Type, "key", request.Key)
+				requestLogger.Info("Deletion refused by the bucket lock, the resource keeps its finalizer and is retried")
 			case err != nil:
-				logger.Error(err, "Failed to process deletion request", "type", request.Type, "key", request.Key)
+				requestLogger.Error(err, "Failed to process deletion request")
 			}
 		}
 	}
@@ -237,7 +250,7 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	}
 	defer b.deletionSemaphore.Release(1)
 
-	logger.Info("Started processing wal-g backup deletion", "backup", backupKey)
+	logger.Info("Started processing wal-g backup deletion")
 	backup := &cnpgv1.Backup{}
 	err = b.Get(ctx, backupKey, backup)
 	if err != nil {
@@ -313,18 +326,24 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 
 	// Delete the backup using WAL-G
 	logger.Info("Deleting backup from storage via WAL-G", "backupID", backup.Status.BackupID)
-	result, err := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion).DeleteBackup(ctx, backup.Status.BackupID)
+	walgClient := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion)
+	result, err := walgClient.DeleteBackup(ctx, backup.Status.BackupID)
 	switch {
 	case errors.Is(err, walg.ErrRetainedByLock):
 		// Do not claim a deletion that did not happen: the finalizer stays, the Backup is
 		// marked, and the BackupConfig status counts it (status controller).
-		if markErr := markBackup(ctx, b.Client, backup, v1beta1.BackupRetainedByLockAnnotationName,
-			v1beta1.BackupDeletionFailingAnnotationName, time.Now()); markErr != nil {
-			return fmt.Errorf("while marking backup %v retained by bucket lock: %w", backupKey, markErr)
-		}
-		return err
+		return b.retainedByLock(ctx, backup, walgClient, storagePrefix(backupConfigWithSecrets))
 	case errors.Is(err, walg.ErrStorageGone):
-		logger.Info("The bucket does not exist, nothing left to delete", "backup", backupKey)
+		logger.Info("The bucket does not exist, nothing left to delete")
+	case errors.Is(err, walg.ErrBackupNotInStorage):
+		// Written before the BackupConfig moved to another prefix: the switch to libsodium
+		// left the plain archive <bucket>/walg/<name> next to <bucket>/walg-enc/<name>, and
+		// the bucket lifecycle rule walg-plain-expiry (32 days) deletes it there, a day after
+		// retention (31 days) gets to it. Nothing for wal-g to delete in this storage.
+		logger.Info("Backup is not in the storage of its BackupConfig (written before the BackupConfig "+
+			"moved to another prefix, such as the plain archive the switch to walg-enc left behind, "+
+			"which the bucket lifecycle expires): nothing to delete, releasing the Backup",
+			"backupID", backup.Status.BackupID, "storage", storagePrefix(backupConfigWithSecrets))
 	case err != nil:
 		return b.deletionFailed(ctx, backup, fmt.Errorf(
 			"while wal-g backup removal: error %w\nWAL-G stdout: %s\nWAL-G stderr: %s",
@@ -335,6 +354,126 @@ func (b *BackupDeletionController) deleteWALGBackup(ctx context.Context, backupK
 	}
 
 	return removeBackupFinalizer(ctx, backup, b.Client)
+}
+
+// lockExpiryMargin is added to the computed lock expiry: R2 evaluates the lock age itself.
+const lockExpiryMargin = 10 * time.Minute
+
+var r2BucketLockGVK = schema.GroupVersionKind{Group: "r2.cloudflare.maestra.io", Version: "v1alpha2", Kind: "R2BucketLock"}
+
+// retainedByLock marks a Backup whose deletion the bucket lock refused and, when the lock
+// age of the bucket is known, records when the lock releases the backup's newest object,
+// so the deletion is retried then and not every hour until then. It returns
+// walg.ErrRetainedByLock: the finalizer stays.
+func (b *BackupDeletionController) retainedByLock(
+	ctx context.Context, backup *cnpgv1.Backup, walgClient *walg.Client, prefix string,
+) error {
+	logger := logr.FromContextOrDiscard(ctx)
+	if err := markBackup(ctx, b.Client, backup, v1beta1.BackupRetainedByLockAnnotationName,
+		v1beta1.BackupDeletionFailingAnnotationName, time.Now()); err != nil {
+		return fmt.Errorf("while marking backup %s retained by bucket lock: %w", backup.Name, err)
+	}
+
+	lockAge, err := b.bucketLockAge(ctx, backup.Namespace, prefix)
+	if err != nil {
+		logger.Info("Lock age of the bucket unknown, the deletion is retried with backoff", "reason", err.Error())
+		return walg.ErrRetainedByLock
+	}
+	written, err := walgClient.BackupLastModified(ctx, backup.Status.BackupID)
+	if err != nil {
+		logger.Info("Last write of the backup unknown, the deletion is retried with backoff", "reason", err.Error())
+		return walg.ErrRetainedByLock
+	}
+	until := written.Add(lockAge + lockExpiryMargin)
+	if !until.After(time.Now()) {
+		// the lock should be gone already: no schedule to trust, back off as before
+		return walg.ErrRetainedByLock
+	}
+	patch := client.MergeFrom(backup.DeepCopy())
+	backup.Annotations[v1beta1.BackupRetainedUntilAnnotationName] = until.UTC().Format(time.RFC3339)
+	if err := b.Patch(ctx, backup, patch); err != nil {
+		return fmt.Errorf("while recording the lock expiry of backup %s: %w", backup.Name, err)
+	}
+	logger.Info("Deletion is retried when the bucket lock releases the backup",
+		"backupID", backup.Status.BackupID, "lastWrite", written, "lockAge", lockAge, "retryAt", until.UTC())
+	return walg.ErrRetainedByLock
+}
+
+// bucketLockAge returns the longest age lock covering the storage at prefix, read from
+// the R2BucketLocks of the namespace (Crossplane provider-cloudflare). Any rule covering
+// it that is not an age rule makes the expiry unknowable from here.
+func (b *BackupDeletionController) bucketLockAge(ctx context.Context, namespace, prefix string) (time.Duration, error) {
+	location, err := url.Parse(prefix)
+	if err != nil || location.Host == "" {
+		return 0, fmt.Errorf("no bucket in prefix %q", prefix)
+	}
+	reader := b.APIReader
+	if reader == nil {
+		reader = b.Client
+	}
+	locks := &unstructured.UnstructuredList{}
+	locks.SetGroupVersionKind(r2BucketLockGVK.GroupVersion().WithKind(r2BucketLockGVK.Kind + "List"))
+	if err := reader.List(ctx, locks, client.InNamespace(namespace)); err != nil {
+		return 0, fmt.Errorf("listing R2BucketLocks: %w", err)
+	}
+	// every object key of the storage starts with this
+	storageKeys := strings.Trim(location.Path, "/") + "/"
+	var days int64
+	for _, lock := range locks.Items {
+		if bucket, _, _ := unstructured.NestedString(lock.Object, "spec", "forProvider", "bucketName"); bucket != location.Host {
+			continue
+		}
+		rules, _, _ := unstructured.NestedSlice(lock.Object, "spec", "forProvider", "rules")
+		for _, r := range rules {
+			rule, _ := r.(map[string]any)
+			if enabled, _, _ := unstructured.NestedBool(rule, "enabled"); !enabled {
+				continue
+			}
+			// a rule covers the keys under its prefix (all keys without one); one covering
+			// only a part of the storage may or may not cover this backup: no schedule
+			prefix, _, _ := unstructured.NestedString(rule, "prefix")
+			if strings.HasPrefix(prefix, storageKeys) && prefix != storageKeys {
+				return 0, fmt.Errorf("R2BucketLock %s has a rule for a part of the storage (%s)", lock.GetName(), prefix)
+			}
+			if !strings.HasPrefix(storageKeys, prefix) {
+				continue
+			}
+			condition, _, _ := unstructured.NestedMap(rule, "condition")
+			age, isAge := condition["ageDays"].(int64)
+			if !isAge || len(condition) != 1 {
+				return 0, fmt.Errorf("R2BucketLock %s has a rule that is not an age rule", lock.GetName())
+			}
+			days = max(days, age)
+		}
+	}
+	if days == 0 {
+		return 0, fmt.Errorf("no age lock rule for bucket %s", location.Host)
+	}
+	return time.Duration(days) * 24 * time.Hour, nil
+}
+
+// storagePrefix is the resolved storage prefix of the BackupConfig.
+func storagePrefix(backupConfig *v1beta1.BackupConfigWithSecrets) string {
+	switch {
+	case backupConfig.Spec.Storage.S3 != nil:
+		return backupConfig.Spec.Storage.S3.ResolvedPrefix
+	case backupConfig.Spec.Storage.GCS != nil:
+		return backupConfig.Spec.Storage.GCS.ResolvedPrefix
+	}
+	return ""
+}
+
+// waitForLockExpiry returns how long a deletion refused by the bucket lock still waits for
+// the recorded lock expiry (BackupRetainedUntilAnnotationName), if it is in the future.
+// A Backup annotated to skip the storage cleanup, or whose BackupConfig (nil when not
+// found) is, does not wait: it is released now.
+func waitForLockExpiry(backup *cnpgv1.Backup, backupConfig *v1beta1.BackupConfig, now time.Time) (time.Duration, bool) {
+	until, err := time.Parse(time.RFC3339, backup.Annotations[v1beta1.BackupRetainedUntilAnnotationName])
+	if err != nil || !until.After(now) || skipStorageCleanup(backup) ||
+		(backupConfig != nil && skipStorageCleanup(backupConfig)) {
+		return 0, false
+	}
+	return until.Sub(now), true
 }
 
 // ownedBy reports whether the Backup's owner reference names this very BackupConfig
