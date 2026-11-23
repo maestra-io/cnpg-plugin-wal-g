@@ -39,9 +39,18 @@ import (
 )
 
 const (
-	// Maximum number of concurrent status reconciliation workers.
-	// Controls the static goroutine pool size to prevent overloading S3 storage.
-	maxStatusReconcileConcurrency = 3
+	// Bounds of the status worker pool. Each pass sizes the pool to the number of
+	// BackupConfigs (statusWorkersFor); every worker runs one wal-g process at a time
+	// (~46MB RSS on omega, 23.11.2026), so the ceiling also bounds the memory.
+	minStatusReconcileWorkers = 3
+	maxStatusReconcileWorkers = 16
+
+	// Expected duration of one BackupConfig status reconcile, used to size the pool.
+	// Omega 23.11.2026, 640 reconciles: mean 12.4s, p50 11s, p90 18s, max 26s.
+	// ponytail: fixed estimate, not a measured average, so a slow storage cannot grow
+	// the pool past what the small clusters' 512Mi limit holds; a slower pass is
+	// only late, never dropped (deduplicated queue).
+	statusReconcileEstimate = 15 * time.Second
 
 	// Timeout for a single BackupConfig status reconciliation
 	statusReconcileTimeout = 10 * time.Minute
@@ -84,8 +93,18 @@ type BackupConfigStatusController struct {
 
 	// inFlight tracks BackupConfigs currently being reconciled to prevent
 	// parallel reconciliation of the same resource
-	inFlight   map[string]struct{}
+	inFlight map[string]struct{}
+	// pending tracks BackupConfigs sitting in queue: a key is queued at most once,
+	// so a pass that outlasts checkInterval neither duplicates nor drops keys
+	pending    map[string]struct{}
 	inFlightMu sync.Mutex
+
+	// worker pool: workers running, wantWorkers the size set by the last pass
+	poolMu      sync.Mutex
+	workers     int
+	wantWorkers int
+	workerSeq   int
+	workersWG   sync.WaitGroup
 
 	// ctx is the root context for the controller, set during Start
 	ctx    context.Context
@@ -110,6 +129,7 @@ func NewBackupConfigStatusController(
 		storageCheckRetryBackoff: defaultStorageCheckRetryBackoff,
 		queue:                    make(chan types.NamespacedName, statusReconcileQueueSize),
 		inFlight:                 make(map[string]struct{}),
+		pending:                  make(map[string]struct{}),
 	}
 }
 
@@ -120,20 +140,13 @@ func (c *BackupConfigStatusController) Start(ctx context.Context) error {
 		"checkInterval", c.checkInterval,
 		"storageCheckTimeout", c.storageCheckTimeout,
 		"storageCheckAttempts", storageCheckAttempts,
-		"workers", maxStatusReconcileConcurrency,
+		"minWorkers", minStatusReconcileWorkers,
+		"maxWorkers", maxStatusReconcileWorkers,
 	)
 	ctx = logr.NewContext(ctx, c.logger)
 	c.ctx = ctx
 
-	// Start the static worker pool
-	var wg sync.WaitGroup
-	for i := 0; i < maxStatusReconcileConcurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			c.worker(ctx, workerID)
-		}(i)
-	}
+	c.resizeWorkers(ctx, minStatusReconcileWorkers)
 
 	// Periodic enqueue loop
 	ticker := time.NewTicker(c.checkInterval)
@@ -143,11 +156,10 @@ func (c *BackupConfigStatusController) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			c.logger.Info("Stopping BackupConfig status controller, waiting for workers to finish")
-			wg.Wait()
+			c.workersWG.Wait()
 			c.logger.Info("All workers stopped")
 			return nil
 		case <-ticker.C:
-			c.logger.Info("Running periodic BackupConfig status reconciliation")
 			c.enqueueAllStatuses(ctx)
 		}
 	}
@@ -161,15 +173,65 @@ func (c *BackupConfigStatusController) NeedLeaderElection() bool {
 
 // EnqueueStatusUpdate enqueues a status reconciliation for a specific BackupConfig.
 // This can be called externally (e.g. after backup creation or BackupConfig changes)
-// to trigger an immediate status update. Non-blocking: if the queue is full,
-// the request is dropped (the periodic reconciliation will pick it up later).
-func (c *BackupConfigStatusController) EnqueueStatusUpdate(key types.NamespacedName) {
+// to trigger an immediate status update. A key already in the queue is not queued
+// again. Non-blocking: if the queue is full, the request is dropped (the periodic
+// reconciliation will pick it up later). Returns whether the key was queued.
+func (c *BackupConfigStatusController) EnqueueStatusUpdate(key types.NamespacedName) bool {
+	queueKey := key.String()
+	c.inFlightMu.Lock()
+	defer c.inFlightMu.Unlock()
+	if _, queued := c.pending[queueKey]; queued {
+		c.logger.V(1).Info("Status update already queued", "backupConfig", key)
+		return false
+	}
 	select {
 	case c.queue <- key:
+		c.pending[queueKey] = struct{}{}
 		c.logger.V(1).Info("Enqueued status update", "backupConfig", key)
+		return true
 	default:
 		c.logger.V(1).Info("Status reconciliation queue is full, dropping request", "backupConfig", key)
+		return false
 	}
+}
+
+// statusWorkersFor sizes the worker pool so that a pass over n BackupConfigs fits
+// in 3/4 of interval, within [minStatusReconcileWorkers, maxStatusReconcileWorkers].
+func statusWorkersFor(n int, interval time.Duration) int {
+	budget := interval * 3 / 4
+	workers := minStatusReconcileWorkers
+	if budget > 0 {
+		workers = max(workers, int((time.Duration(n)*statusReconcileEstimate+budget-1)/budget))
+	}
+	return min(workers, maxStatusReconcileWorkers)
+}
+
+// resizeWorkers starts workers up to want; surplus workers exit after their
+// current reconcile (retireWorker).
+func (c *BackupConfigStatusController) resizeWorkers(ctx context.Context, want int) {
+	c.poolMu.Lock()
+	defer c.poolMu.Unlock()
+	c.wantWorkers = want
+	for c.workers < want {
+		c.workers++
+		c.workerSeq++
+		c.workersWG.Add(1)
+		go func(workerID int) {
+			defer c.workersWG.Done()
+			c.worker(ctx, workerID)
+		}(c.workerSeq)
+	}
+}
+
+// retireWorker reports whether the calling worker is surplus and must exit.
+func (c *BackupConfigStatusController) retireWorker() bool {
+	c.poolMu.Lock()
+	defer c.poolMu.Unlock()
+	if c.workers > c.wantWorkers {
+		c.workers--
+		return true
+	}
+	return false
 }
 
 // enqueueAllStatuses lists all BackupConfig resources and enqueues status reconciliation for each
@@ -180,18 +242,27 @@ func (c *BackupConfigStatusController) enqueueAllStatuses(ctx context.Context) {
 		return
 	}
 
-	if len(c.queue) > 0 {
-		c.logger.Error(fmt.Errorf("there are still some backupconfigs pending in queue"), "Cannot enqueue backupconfigs for status update")
-		return
-	}
+	workers := statusWorkersFor(len(backupConfigList.Items), c.checkInterval)
+	c.resizeWorkers(ctx, workers)
 
+	// Keys still queued from the previous pass stay where they are; only the others
+	// are queued, so a pass longer than checkInterval delays keys but never drops them.
+	queued := 0
 	for i := range backupConfigList.Items {
 		backupConfig := &backupConfigList.Items[i]
-		c.EnqueueStatusUpdate(types.NamespacedName{
+		if c.EnqueueStatusUpdate(types.NamespacedName{
 			Namespace: backupConfig.Namespace,
 			Name:      backupConfig.Name,
-		})
+		}) {
+			queued++
+		}
 	}
+	c.logger.Info("Running periodic BackupConfig status reconciliation",
+		"backupConfigs", len(backupConfigList.Items),
+		"queued", queued,
+		"alreadyQueued", len(backupConfigList.Items)-queued,
+		"workers", workers,
+	)
 }
 
 // worker is a single worker goroutine that processes reconciliation requests from the shared queue
@@ -200,6 +271,10 @@ func (c *BackupConfigStatusController) worker(ctx context.Context, workerID int)
 	logger.V(1).Info("Worker started")
 
 	for {
+		if c.retireWorker() {
+			logger.V(1).Info("Worker retired, pool shrunk")
+			return
+		}
 		select {
 		case <-ctx.Done():
 			logger.V(1).Info("Worker stopping")
@@ -228,12 +303,13 @@ func (c *BackupConfigStatusController) worker(ctx context.Context, workerID int)
 	}
 }
 
-// tryAcquire attempts to mark a BackupConfig as in-flight.
-// Returns true if the BackupConfig was not already in-flight and is now marked.
+// tryAcquire takes a BackupConfig off the pending set and attempts to mark it
+// as in-flight. Returns true if the BackupConfig was not already in-flight and is now marked.
 func (c *BackupConfigStatusController) tryAcquire(queueKey string) bool {
 	c.inFlightMu.Lock()
 	defer c.inFlightMu.Unlock()
 
+	delete(c.pending, queueKey)
 	if _, exists := c.inFlight[queueKey]; exists {
 		return false
 	}
