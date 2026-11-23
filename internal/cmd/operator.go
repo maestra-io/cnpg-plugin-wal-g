@@ -90,6 +90,11 @@ func NewOperatorCmd() *cobra.Command {
 	_ = viper.BindPFlag(operator.StorageCheckTimeoutKey, cmd.Flags().Lookup(operator.StorageCheckTimeoutKey))
 	_ = viper.BindEnv(operator.StorageCheckTimeoutKey, "STORAGE_CHECK_TIMEOUT")
 
+	cmd.Flags().Duration(operator.BackupConfigStatusIntervalKey, operator.DefaultBackupConfigStatusInterval,
+		"Period of the BackupConfig status pass (storage checks, wal-show, backup-list for every BackupConfig).")
+	_ = viper.BindPFlag(operator.BackupConfigStatusIntervalKey, cmd.Flags().Lookup(operator.BackupConfigStatusIntervalKey))
+	_ = viper.BindEnv(operator.BackupConfigStatusIntervalKey, "BACKUP_CONFIG_STATUS_INTERVAL")
+
 	cmd.Flags().String("cnpg-i-cert-path", "", "The directory that contains the CNPG-I GRPC server certificate.")
 	_ = viper.BindPFlag("cnpg-i-cert-path", cmd.Flags().Lookup("cnpg-i-cert-path"))
 

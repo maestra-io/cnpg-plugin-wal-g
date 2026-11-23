@@ -62,7 +62,8 @@ Durations take Go syntax (`15s`, `500ms`); a bare number means seconds.
 
 ## Storage availability check
 
-The controller's BackupConfig status loop (every 2 minutes) runs `wal-g st check read`
+The controller's BackupConfig status loop (at start, then every 10 minutes:
+`--backup-config-status-interval`, env `BACKUP_CONFIG_STATUS_INTERVAL`) runs `wal-g st check read`
 and `wal-g st check write` against each BackupConfig's storage and sets the conditions
 `StorageReadable` / `StorageWritable`; the instance sidecar exports them as
 `cnpg_plugin_wal_g_s3_read_availability` / `cnpg_plugin_wal_g_s3_write_availability`.

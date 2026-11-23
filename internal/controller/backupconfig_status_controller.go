@@ -148,6 +148,10 @@ func (c *BackupConfigStatusController) Start(ctx context.Context) error {
 
 	c.resizeWorkers(ctx, minStatusReconcileWorkers)
 
+	// First pass at once: with a 10-minute interval a new leader would otherwise
+	// leave new BackupConfigs without status for a whole interval.
+	c.enqueueAllStatuses(ctx)
+
 	// Periodic enqueue loop
 	ticker := time.NewTicker(c.checkInterval)
 	defer ticker.Stop()

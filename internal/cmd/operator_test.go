@@ -39,4 +39,15 @@ var _ = Describe("operator command", func() {
 		Expect(command.Flags().Set(operator.StorageCheckTimeoutKey, "90s")).To(Succeed())
 		Expect(viper.GetDuration(operator.StorageCheckTimeoutKey)).To(Equal(90 * time.Second))
 	})
+
+	It("has --backup-config-status-interval, default 10m, bound to viper", func() {
+		command := NewOperatorCmd()
+		flag := command.Flags().Lookup(operator.BackupConfigStatusIntervalKey)
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.DefValue).To(Equal("10m0s"))
+		Expect(viper.GetDuration(operator.BackupConfigStatusIntervalKey)).To(Equal(10 * time.Minute))
+
+		Expect(command.Flags().Set(operator.BackupConfigStatusIntervalKey, "2m")).To(Succeed())
+		Expect(viper.GetDuration(operator.BackupConfigStatusIntervalKey)).To(Equal(2 * time.Minute))
+	})
 })
