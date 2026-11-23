@@ -369,12 +369,16 @@ func (c *BackupConfigStatusController) reconcileStatusByKey(
 	// while the storage is unreachable, which is when a deletion fails.
 	c.reconcileBackupTimestamps(ctx, backupConfig, logger)
 
+	var pgMajors []int
 	if readable {
-		// Check WAL integrity and reconcile WAL-related status fields via wal-g wal-show
-		c.reconcileWALStatus(ctx, backupConfig, backupConfigWithSecrets, logger)
+		// The archives this pass reads, from one listing of the prefix
+		pgMajors = c.discoverPGMajors(ctx, backupConfig, backupConfigWithSecrets, logger)
 
-		// Reconcile consumed storage from wal-g backup-list across all known PG versions
-		c.reconcileConsumedStorage(ctx, backupConfig, backupConfigWithSecrets, logger)
+		// Check WAL integrity and reconcile WAL-related status fields via wal-g wal-show
+		c.reconcileWALStatus(ctx, backupConfig, backupConfigWithSecrets, pgMajors, logger)
+
+		// Reconcile consumed storage from wal-g backup-list of the same PG majors
+		c.reconcileConsumedStorage(ctx, backupConfig, backupConfigWithSecrets, pgMajors, logger)
 	}
 
 	// Determine overall phase from conditions
@@ -385,7 +389,8 @@ func (c *BackupConfigStatusController) reconcileStatusByKey(
 		return fmt.Errorf("failed to update BackupConfig status: %w", err)
 	}
 
-	logger.Info("Successfully reconciled BackupConfig status", "phase", backupConfig.Status.Phase)
+	logger.Info("Successfully reconciled BackupConfig status", "phase", backupConfig.Status.Phase,
+		"pgMajors", pgMajors)
 	return nil
 }
 
@@ -474,7 +479,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // reconcileWALStatus checks WAL integrity and evaluates recoverability points
-// by running `wal-g wal-show --detailed-json` across all known PG major versions.
+// by running `wal-g wal-show --detailed-json` for each of pgMajors.
 //
 // Missing segments below the start segment of the earliest backup in storage
 // are not counted: no backup can need them for a restore. They show up after a
@@ -487,13 +492,13 @@ func (c *BackupConfigStatusController) reconcileWALStatus(
 	ctx context.Context,
 	backupConfig *v1beta1.BackupConfig,
 	backupConfigWithSecrets *v1beta1.BackupConfigWithSecrets,
+	pgMajors []int,
 	logger logr.Logger,
 ) {
 	total := walIntegrityResult{AllTimelinesOK: true}
 	var earliestBackupTime *time.Time
 
-	// Iterate over all known PG major versions to collect WAL info
-	for pgVersion := 11; pgVersion <= 19; pgVersion++ {
+	for _, pgVersion := range pgMajors {
 		walgClient := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion)
 		timelines, err := walgClient.WALShow(ctx)
 		if err != nil {
@@ -569,6 +574,64 @@ func (c *BackupConfigStatusController) reconcileWALStatus(
 		setCondition(backupConfig, v1beta1.ConditionTypeWALIntegrityCheck, metav1.ConditionFalse,
 			reason, message)
 	}
+}
+
+// Known PG majors, all probed when the prefix cannot be listed.
+const (
+	minKnownPGMajor = 11
+	maxKnownPGMajor = 19
+)
+
+// discoverPGMajors returns the PG majors whose archive (<prefix>/<major>) the status
+// pass reads, from one listing of the prefix and the Clusters archiving to it.
+func (c *BackupConfigStatusController) discoverPGMajors(
+	ctx context.Context,
+	backupConfig *v1beta1.BackupConfig,
+	backupConfigWithSecrets *v1beta1.BackupConfigWithSecrets,
+	logger logr.Logger,
+) []int {
+	folders, err := walg.NewPrefixClient(backupConfigWithSecrets).StorageLsFolders(ctx)
+	if err != nil {
+		logger.Info("Cannot list the BackupConfig prefix, probing every known PG major", "error", err.Error())
+	}
+
+	var clusterMajors []int
+	clusters := &cnpgv1.ClusterList{}
+	if err := c.client.List(ctx, clusters, client.InNamespace(backupConfig.Namespace)); err != nil {
+		logger.Error(err, "Failed to list Clusters")
+	}
+	key := client.ObjectKeyFromObject(backupConfig)
+	for i := range clusters.Items {
+		if !v1beta1.BackupConfigIsUsedForArchivation(key, &clusters.Items[i]) {
+			continue
+		}
+		if major, err := clusters.Items[i].GetPostgresqlMajorVersion(); err == nil {
+			clusterMajors = append(clusterMajors, major)
+		}
+	}
+	return pgMajorsToProbe(folders, err == nil, clusterMajors)
+}
+
+// pgMajorsToProbe returns, sorted, the numeric folders of the prefix listing (a major's
+// folder exists while it holds backups or WAL, so an old major stays after an upgrade
+// until its last object is gone) and the majors of the Clusters archiving to the prefix
+// (a new major right after an upgrade, before its first object). Without a listing
+// (listed false) it returns every known major.
+func pgMajorsToProbe(folders []string, listed bool, clusterMajors []int) []int {
+	majors := lo.SliceToMap(clusterMajors, func(m int) (int, struct{}) { return m, struct{}{} })
+	if !listed {
+		for m := minKnownPGMajor; m <= maxKnownPGMajor; m++ {
+			majors[m] = struct{}{}
+		}
+	}
+	for _, folder := range folders {
+		if m, err := strconv.Atoi(folder); err == nil && m > 0 {
+			majors[m] = struct{}{}
+		}
+	}
+	result := lo.Keys(majors)
+	sort.Ints(result)
+	return result
 }
 
 // walIntegrityResult is the WAL integrity verdict for one or more wal-g prefixes.
@@ -714,19 +777,18 @@ func (c *BackupConfigStatusController) reconcileBackupTimestamps(
 
 // reconcileConsumedStorage calculates total consumed storage space by fetching backup metadata
 // from wal-g backup-list (for backup CompressedSize) and wal-g st ls (for WAL file sizes)
-// across all known PG major versions
+// of each of pgMajors
 func (c *BackupConfigStatusController) reconcileConsumedStorage(
 	ctx context.Context,
 	backupConfig *v1beta1.BackupConfig,
 	backupConfigWithSecrets *v1beta1.BackupConfigWithSecrets,
+	pgMajors []int,
 	logger logr.Logger,
 ) {
 	var backupBytes int64
 	var walBytes int64
 
-	// Iterate over all known PG major versions to collect backup and WAL sizes
-	// (same approach as in deleteBackupConfig)
-	for pgVersion := 11; pgVersion <= 19; pgVersion++ {
+	for _, pgVersion := range pgMajors {
 		walgClient := walg.NewClientFromBackupConfig(backupConfigWithSecrets, pgVersion)
 
 		// Sum backup compressed sizes from wal-g backup-list

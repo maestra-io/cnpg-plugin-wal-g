@@ -131,6 +131,12 @@ func NewStorageCheckClient(backupConfig *v1beta1.BackupConfigWithSecrets) *Clien
 	return NewClient(newConfigFromBackupConfig(backupConfig, StorageCheckFolder))
 }
 
+// NewPrefixClient returns a Client whose storage is the BackupConfig prefix itself, the
+// parent of the <prefix>/<pg major> archives and of <prefix>/storage-check.
+func NewPrefixClient(backupConfig *v1beta1.BackupConfigWithSecrets) *Client {
+	return NewClient(newConfigFromBackupConfig(backupConfig, ""))
+}
+
 func NewConfigFromBackupConfig(backupConfig *v1beta1.BackupConfigWithSecrets, pgMajorVersion int) *Config {
 	return newConfigFromBackupConfig(backupConfig, strconv.Itoa(pgMajorVersion))
 }
