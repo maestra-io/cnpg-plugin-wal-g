@@ -219,3 +219,35 @@ func parseStorageLsOutput(output []byte) (int64, error) {
 
 	return totalSize, nil
 }
+
+// BackupLastModified returns the time of the newest object of a backup: its sentinel in
+// basebackups_005/ and the objects of basebackups_005/<backup>/ (metadata.json is
+// rewritten by backup-mark). An R2 bucket lock counts its age from that write.
+func (c *Client) BackupLastModified(ctx context.Context, backupName string) (time.Time, error) {
+	var newest time.Time
+	for _, folder := range []string{"basebackups_005/", "basebackups_005/" + backupName + "/"} {
+		result, err := cmd.New("wal-g", "st", "ls", folder).
+			WithContext(ctx).
+			WithEnv(c.config.ToEnvMap()).
+			Run()
+		if err != nil {
+			return time.Time{}, fmt.Errorf("wal-g st ls %s: %w: %s", folder, err, result.Stderr())
+		}
+		inBackupFolder := folder != "basebackups_005/"
+		for _, line := range strings.Split(string(result.Stdout()), "\n") {
+			// obj  <size> <date> <time> <zone offset> <zone name> <name>
+			fields := strings.Fields(line)
+			if len(fields) != 7 || fields[0] != "obj" || (!inBackupFolder && !strings.HasPrefix(fields[6], backupName)) {
+				continue
+			}
+			modified, err := time.Parse("2006-01-02 15:04:05 -0700", strings.Join(fields[2:5], " "))
+			if err == nil && modified.After(newest) {
+				newest = modified
+			}
+		}
+	}
+	if newest.IsZero() {
+		return newest, fmt.Errorf("no objects of backup %s in storage", backupName)
+	}
+	return newest.UTC(), nil
+}

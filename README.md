@@ -110,6 +110,9 @@ data only when:
 
 - the Backup has no physical backup (`status.backupID` empty);
 - the bucket does not exist (S3 `NoSuchBucket`);
+- the backup is not in the storage of its BackupConfig: it was written before the
+  BackupConfig moved to another prefix (the plain `walg/` archive a switch to `walg-enc/`
+  left behind). It is not deleted there; the bucket lifecycle expires that archive;
 - `retention.ignoreForBackupDeletion: true`;
 - the annotation `cnpg-plugin-wal-g.yandex.cloud/skip-storage-cleanup: "true"` is on the
   Backup (or on its BackupConfig, while that exists).
@@ -120,6 +123,10 @@ BackupConfig gets condition `BackupDeletionFailing` and the sidecar exports
 `cnpg_plugin_wal_g_backup_deletion_failing 1`; retries back off from 7 minutes to 1 hour.
 A deletion refused by an R2 bucket lock is not a failure: `retained-by-bucket-lock`,
 condition `BackupDeletionRetainedByLock`, metric `..._backup_deletion_retained_by_lock`.
+When the namespace has an `R2BucketLock` (`r2.cloudflare.maestra.io/v1alpha2`) for the
+bucket with age rules only, the Backup also gets `retained-by-bucket-lock-until`: the last
+write of its newest object plus the lock age, and is not retried before that. Without one
+the retry backs off as above.
 
 | Condition reason | Cause | What to do |
 |---|---|---|
