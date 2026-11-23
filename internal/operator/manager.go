@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -88,6 +89,17 @@ const (
 	// env STORAGE_CHECK_TIMEOUT) of the budget of one `wal-g st check` call of
 	// the BackupConfig status controller.
 	StorageCheckTimeoutKey = "storage-check-timeout"
+
+	// BackupConfigStatusIntervalKey is the viper key (flag --backup-config-status-interval,
+	// env BACKUP_CONFIG_STATUS_INTERVAL) of the period of the BackupConfig status pass.
+	BackupConfigStatusIntervalKey = "backup-config-status-interval"
+
+	// DefaultBackupConfigStatusInterval is the default period of the status pass. Its
+	// consumers need no more: CnpgBackupDeletionFailing fires after 1h,
+	// PostgresqlNoRecentBackup after 36h, and WalgS3StorageUnavailable on a 15m window
+	// plus for: 20m. Each pass lists every BackupConfig's storage (~40 R2 Class A
+	// operations per BackupConfig, omega 22.11.2026).
+	DefaultBackupConfigStatusInterval = 10 * time.Minute
 )
 
 func init() {
@@ -219,9 +231,15 @@ func Start(ctx context.Context) error {
 	}
 
 	// Create and add the BackupConfigStatusController
+	statusInterval := viper.GetDuration(BackupConfigStatusIntervalKey)
+	if statusInterval <= 0 {
+		err := fmt.Errorf("--%s must be positive, got %s", BackupConfigStatusIntervalKey, statusInterval)
+		setupLog.Error(err, "invalid flag")
+		return err
+	}
 	backupConfigStatusController := controller.NewBackupConfigStatusController(
 		mgr.GetClient(),
-		2*time.Minute, // Run status reconciliation each 2 minutes
+		statusInterval,
 		viper.GetDuration(StorageCheckTimeoutKey), // Budget of one 'wal-g st check' call
 	)
 	if err := mgr.Add(backupConfigStatusController); err != nil {
