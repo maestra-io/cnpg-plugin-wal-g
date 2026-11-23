@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -398,9 +399,9 @@ func (b *BackupDeletionController) retainedByLock(
 	return walg.ErrRetainedByLock
 }
 
-// bucketLockAge returns the longest age lock of the bucket of prefix, read from the
-// R2BucketLocks of the namespace (Crossplane provider-cloudflare). Any rule that is not
-// an age rule makes the expiry unknowable from here.
+// bucketLockAge returns the longest age lock covering the storage at prefix, read from
+// the R2BucketLocks of the namespace (Crossplane provider-cloudflare). Any rule covering
+// it that is not an age rule makes the expiry unknowable from here.
 func (b *BackupDeletionController) bucketLockAge(ctx context.Context, namespace, prefix string) (time.Duration, error) {
 	location, err := url.Parse(prefix)
 	if err != nil || location.Host == "" {
@@ -415,6 +416,7 @@ func (b *BackupDeletionController) bucketLockAge(ctx context.Context, namespace,
 	if err := reader.List(ctx, locks, client.InNamespace(namespace)); err != nil {
 		return 0, fmt.Errorf("listing R2BucketLocks: %w", err)
 	}
+	keyPath := strings.TrimPrefix(location.Path, "/")
 	var days int64
 	for _, lock := range locks.Items {
 		if bucket, _, _ := unstructured.NestedString(lock.Object, "spec", "forProvider", "bucketName"); bucket != location.Host {
@@ -424,6 +426,12 @@ func (b *BackupDeletionController) bucketLockAge(ctx context.Context, namespace,
 		for _, r := range rules {
 			rule, _ := r.(map[string]any)
 			if enabled, _, _ := unstructured.NestedBool(rule, "enabled"); !enabled {
+				continue
+			}
+			// a rule covers the keys under its prefix (all keys without one): it applies
+			// when it covers the storage, or a part of it
+			if prefix, _, _ := unstructured.NestedString(rule, "prefix"); !strings.HasPrefix(keyPath, prefix) &&
+				!strings.HasPrefix(prefix, keyPath) {
 				continue
 			}
 			condition, _, _ := unstructured.NestedMap(rule, "condition")
@@ -453,9 +461,10 @@ func storagePrefix(backupConfig *v1beta1.BackupConfigWithSecrets) string {
 
 // waitForLockExpiry returns how long a deletion refused by the bucket lock still waits for
 // the recorded lock expiry (BackupRetainedUntilAnnotationName), if it is in the future.
+// A Backup annotated to skip the storage cleanup does not wait: it is released now.
 func waitForLockExpiry(backup *cnpgv1.Backup, now time.Time) (time.Duration, bool) {
 	until, err := time.Parse(time.RFC3339, backup.Annotations[v1beta1.BackupRetainedUntilAnnotationName])
-	if err != nil || !until.After(now) {
+	if err != nil || !until.After(now) || skipStorageCleanup(backup) {
 		return 0, false
 	}
 	return until.Sub(now), true

@@ -108,7 +108,11 @@ func retainedUntil(t *testing.T, c client.Client) (string, bool) {
 func TestDeleteWALGBackup_LockRefusalRetriesAtTheLockExpiry(t *testing.T) {
 	written := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
 	fakeWalgLocked(t, written)
-	dc, c := writableStorageBackup(t, r2BucketLock("other-bucket", ageRule(2190)), r2BucketLock("test-bucket", ageRule(28)))
+	otherPrefix := ageRule(2190)
+	otherPrefix["prefix"] = "archive/" // another part of the same bucket
+	ownPrefix := ageRule(28)
+	ownPrefix["prefix"] = "test-prefix/"
+	dc, c := writableStorageBackup(t, r2BucketLock("other-bucket", ageRule(2190)), r2BucketLock("test-bucket", otherPrefix, ownPrefix))
 	_ = deleteB(t, dc)
 
 	until, ok := retainedUntil(t, c)
@@ -152,5 +156,15 @@ func TestWaitForLockExpiry(t *testing.T) {
 		if pending != (want > 0) || got != want {
 			t.Errorf("until %q: got %v, %v; want %v", until, got, pending, want)
 		}
+	}
+
+	// asked to skip the storage cleanup: released now, not at the lock expiry
+	backup := &cnpgv1.Backup{}
+	backup.Annotations = map[string]string{
+		v1beta1.BackupRetainedUntilAnnotationName: "2026-12-19T08:10:01Z",
+		v1beta1.SkipStorageCleanupAnnotationName:  "true",
+	}
+	if _, pending := waitForLockExpiry(backup, now); pending {
+		t.Error("a Backup annotated to skip the storage cleanup must not wait for the lock")
 	}
 }
