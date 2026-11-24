@@ -36,7 +36,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  KIND_VERSION: v0.33.0
   IMAGE: docker.io/local/cnpg-plugin-wal-g:e2e
 
 jobs:
@@ -52,10 +51,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install kind
+      # GitHub Releases through nora (packages.maestra.io): 3-day hold, issues-maestra#1649.
+      - name: kind through nora
+        uses: maestra-io/github-actions/nora-asset@a4ecbf696bc63094df4bbe9378bdf8fd170839e9 # v1.115.5
+        with:
+          path: github/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sha256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+          bin: kind
+      - name: Tool versions
         run: |
-          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo install -m 0755 kind /usr/local/bin/kind
           kind version; kubectl version --client; helm version; aws --version; jq --version
 
       # Base images, apt and Go modules through nora (issues-maestra#1649): a credential helper
@@ -104,10 +108,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install kind
+      # GitHub Releases through nora (packages.maestra.io): 3-day hold, issues-maestra#1649.
+      - name: kind through nora
+        uses: maestra-io/github-actions/nora-asset@a4ecbf696bc63094df4bbe9378bdf8fd170839e9 # v1.115.5
+        with:
+          path: github/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sha256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+          bin: kind
+      - name: Tool versions
         run: |
-          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo install -m 0755 kind /usr/local/bin/kind
           kind version; kubectl version --client; helm version; jq --version
 
       # Base images, apt and Go modules through nora (issues-maestra#1649): a credential helper
