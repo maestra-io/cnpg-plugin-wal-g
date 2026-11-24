@@ -182,17 +182,10 @@ func Start(ctx context.Context) error {
 		// the whole operator daily (omega 21-23.11.2026, issues-maestra#1786).
 		LeaseDuration: ptr.To(60 * time.Second),
 		RenewDeadline: ptr.To(40 * time.Second),
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// LeaderElectionReleaseOnCancel stays off. It is safe only if nothing runs after
+		// the Manager stops, and BackupDeletionController does not wait for a `wal-g
+		// delete` in flight. Until the lease expires (a roll) only background work waits:
+		// the CNPG-I listener and the webhooks do not need the lease.
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -302,13 +295,10 @@ func Start(ctx context.Context) error {
 		setupLog.Error(err, "unable to set up health check")
 		return err
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		return err
-	}
 
 	cnpgiConfig := CNPGI{
 		Client:         mgr.GetClient(),
+		Cache:          mgr.GetCache(),
 		ServerAddress:  viper.GetString("cnpg-i-bind-address"),
 		PluginPath:     viper.GetString("cnpg-i-socket-path"),
 		ServerCertPath: viper.GetString("cnpg-i-cert-path"),
@@ -320,6 +310,10 @@ func Start(ctx context.Context) error {
 
 	if err := mgr.Add(&cnpgiConfig); err != nil {
 		setupLog.Error(err, "unable to create CNPGI runnable")
+		return err
+	}
+	if err := mgr.AddReadyzCheck("cnpg-i", cnpgiConfig.ListenerCheck); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
 		return err
 	}
 
