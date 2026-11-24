@@ -16,7 +16,7 @@ ARG USE_LZO=1
 # apt, Go modules: through nora (packages.maestra.io, 3-day hold, issues-maestra#1649); token =
 # BuildKit secret PRIVATE_PACKAGES_TOKEN (docker build --secret id=PRIVATE_PACKAGES_TOKEN,env=...).
 # Install lib dependencies
-RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     . /nora-apt/env.sh && apt-get update && apt-get install -y libbrotli-dev liblzo2-dev libsodium-dev curl cmake git
 # Clone wal-g sources
 RUN git clone --depth 1 --branch ${WALG_VERSION} ${WALG_REPO} $(go env GOPATH)/src/github.com/wal-g/wal-g
@@ -61,7 +61,7 @@ LABEL org.opencontainers.image.source=https://github.com/wal-g/cnpg-plugin-wal-g
 LABEL org.opencontainers.image.description="CloudNativePG WAL-G Backup Plugin"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     . /nora-apt/env.sh && apt-get update && apt-get install -y ca-certificates curl procps && apt-get clean && rm -rf /var/lib/apt/lists/*
 RUN groupadd -o -g 26 postgres && useradd -ms /bin/bash -u 26 -g postgres postgres
 WORKDIR /home/postgres
