@@ -9,6 +9,7 @@ jobs:
     uses: maestra-io/github-actions/.github/workflows/pr-checks.yml@main
     permissions:
       contents: read
+      id-token: write # pr-checks@main takes its tools from nora; without this the run cannot start
     with:
       check-encoding: false
       kustomize: false
