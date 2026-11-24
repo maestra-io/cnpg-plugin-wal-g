@@ -56,6 +56,22 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      # What `make test` (setup-envtest) would take from GitHub Releases, through nora (3-day hold,
+      # issues-maestra#1649): it uses the matching version it finds in bin/k8s. A new k8s.io/api minor
+      # needs its envtest version and sha256 here.
+      - name: envtest through nora
+        id: envtest
+        uses: maestra-io/github-actions/nora-asset@a4ecbf696bc63094df4bbe9378bdf8fd170839e9 # v1.115.5
+        with:
+          path: github/kubernetes-sigs/controller-tools/releases/download/envtest-v1.36.2/envtest-v1.36.2-linux-amd64.tar.gz
+          sha256: 5e99f4eef3d6f9d4dd063730299f708c98da8801f2f14d8fc762cb354f30c332
+      - name: Place envtest
+        env:
+          TGZ: ${{ steps.envtest.outputs.file }}
+        run: |
+          mkdir -p bin/k8s/1.36.2-linux-amd64
+          tar -xzf "$TGZ" --strip-components=2 -C bin/k8s/1.36.2-linux-amd64
+
       - name: Run tests
         run: make test
 
