@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, 'maestra/**' ]
 
+# The toolchain comes from nora only (3-day hold, issues-maestra#1649), with the job's OIDC token, as on
+# main. A fork PR gets no such token: these jobs fail there on purpose, with no unheld fallback. No fork
+# PR has ever been opened here; its changes are pushed to a branch of this repository to be checked.
 jobs:
   lint:
     name: Lint
