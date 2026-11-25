@@ -271,11 +271,17 @@ func reconcilePodSpecWithPluginSidecar(
 
 	sidecarConfig.Resources = backupConfig.Spec.Resources
 
+	readOnlyRoot := common.IsSidecarReadOnlyRootFilesystem(cluster)
+	if readOnlyRoot {
+		injectSidecarTmpVolume(spec)
+		sidecarConfig.VolumeMounts = []corev1.VolumeMount{{Name: sidecarTmpVolumeName, MountPath: "/tmp"}}
+	}
+
 	sidecarConfig.SecurityContext = &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		RunAsNonRoot:             ptr.To(true),
 		Privileged:               ptr.To(false),
-		ReadOnlyRootFilesystem:   ptr.To(false),
+		ReadOnlyRootFilesystem:   ptr.To(readOnlyRoot),
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
@@ -420,6 +426,22 @@ func injectPluginSidecarPodSpec(
 
 	spec.InitContainers = append(spec.InitContainers, *sidecar)
 	return nil
+}
+
+// sidecarTmpVolumeName is the sidecar's /tmp when its root filesystem is read-only.
+const sidecarTmpVolumeName = "plugin-wal-g-tmp"
+
+// injectSidecarTmpVolume adds the sidecar's /tmp emptyDir to spec once.
+func injectSidecarTmpVolume(spec *corev1.PodSpec) {
+	for i := range spec.Volumes {
+		if spec.Volumes[i].Name == sidecarTmpVolumeName {
+			return
+		}
+	}
+	spec.Volumes = append(spec.Volumes, corev1.Volume{
+		Name:         sidecarTmpVolumeName,
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	})
 }
 
 // injectPluginVolumePodSpec injects the plugin volume into a CNPG Pod spec.

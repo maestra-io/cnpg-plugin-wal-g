@@ -670,6 +670,57 @@ var _ = Describe("LifecycleImplementation", func() {
 		})
 	})
 
+	Describe("sidecarReadOnlyRootFilesystem", func() {
+		It("is off without the parameter: writable root, no /tmp volume", func() {
+			podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "postgres"}}}
+			Expect(reconcilePodSpecWithPluginSidecar(testCluster, testBackupConfig, podSpec, "postgres", nil)).To(Succeed())
+			Expect(podSpec.InitContainers[0].SecurityContext.ReadOnlyRootFilesystem).To(Equal(ptr.To(false)))
+			Expect(podSpec.Volumes).NotTo(ContainElement(HaveField("Name", "plugin-wal-g-tmp")))
+			Expect(podSpec.InitContainers[0].VolumeMounts).NotTo(ContainElement(HaveField("MountPath", "/tmp")))
+		})
+
+		DescribeTable("values other than \"true\" keep the writable root",
+			func(value string) {
+				cluster := testCluster.DeepCopy()
+				cluster.Spec.Plugins[0].Parameters["sidecarReadOnlyRootFilesystem"] = value
+				podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "postgres"}}}
+				Expect(reconcilePodSpecWithPluginSidecar(cluster, testBackupConfig, podSpec, "postgres", nil)).To(Succeed())
+				Expect(podSpec.InitContainers[0].SecurityContext.ReadOnlyRootFilesystem).To(Equal(ptr.To(false)))
+				Expect(podSpec.Volumes).NotTo(ContainElement(HaveField("Name", "plugin-wal-g-tmp")))
+			},
+			Entry("false", "false"), Entry("empty", ""), Entry("True", "True"),
+		)
+
+		It("\"true\" makes the root read-only with an emptyDir on /tmp, on pods and recovery jobs", func() {
+			cluster := testCluster.DeepCopy()
+			cluster.Spec.Plugins[0].Parameters["sidecarReadOnlyRootFilesystem"] = "true"
+			for _, role := range []string{"postgres", "full-recovery"} {
+				podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: role,
+					VolumeMounts: []corev1.VolumeMount{{Name: "pgdata", MountPath: "/var/lib/postgresql/data"}}}}}
+				Expect(reconcilePodSpecWithPluginSidecar(cluster, testBackupConfig, podSpec, role, nil)).To(Succeed())
+				sidecar := podSpec.InitContainers[0]
+				Expect(sidecar.SecurityContext.ReadOnlyRootFilesystem).To(Equal(ptr.To(true)))
+				Expect(sidecar.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: "plugin-wal-g-tmp", MountPath: "/tmp"}))
+				Expect(sidecar.VolumeMounts).To(ContainElement(HaveField("MountPath", "/var/lib/postgresql/data")))
+				Expect(podSpec.Volumes).To(ContainElement(corev1.Volume{Name: "plugin-wal-g-tmp",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}))
+				// the main container does not get the sidecar's /tmp
+				Expect(podSpec.Containers[0].VolumeMounts).NotTo(ContainElement(HaveField("MountPath", "/tmp")))
+
+				// a second pass (sidecar already present) adds nothing twice
+				Expect(reconcilePodSpecWithPluginSidecar(cluster, testBackupConfig, podSpec, role, nil)).To(Succeed())
+				n := 0
+				for _, v := range podSpec.Volumes {
+					if v.Name == "plugin-wal-g-tmp" {
+						n++
+					}
+				}
+				Expect(n).To(Equal(1))
+				Expect(podSpec.InitContainers).To(HaveLen(1))
+			}
+		})
+	})
+
 	Describe("plugin-wal-g startupProbe", func() {
 		newPodSpec := func() *corev1.PodSpec {
 			return &corev1.PodSpec{Containers: []corev1.Container{{Name: "postgres"}}}
