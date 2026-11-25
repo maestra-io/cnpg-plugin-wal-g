@@ -100,10 +100,19 @@ func GetInitContainerRestartPolicy(cluster *cnpgv1.Cluster) *corev1.ContainerRes
 const SidecarReadOnlyRootFilesystemParameter = "sidecarReadOnlyRootFilesystem"
 
 // IsSidecarReadOnlyRootFilesystem reports whether cluster asks for a read-only
-// sidecar root filesystem (SidecarReadOnlyRootFilesystemParameter is "true").
+// sidecar root filesystem: SidecarReadOnlyRootFilesystemParameter is "true" in
+// its spec.plugins entry or in the plugin of its recovery source (a Cluster that
+// only restores, such as a backup-verification one, has no spec.plugins entry,
+// and its full-recovery Job still gets the sidecar).
 func IsSidecarReadOnlyRootFilesystem(cluster *cnpgv1.Cluster) bool {
-	pluginConfig := GetPluginConfigFromCluster(cluster)
-	return pluginConfig != nil && pluginConfig.Parameters[SidecarReadOnlyRootFilesystemParameter] == "true"
+	for _, pluginConfig := range []*cnpgv1.PluginConfiguration{
+		GetPluginConfigFromCluster(cluster), GetRecoveryPluginConfigFromCluster(cluster),
+	} {
+		if pluginConfig != nil && pluginConfig.Parameters[SidecarReadOnlyRootFilesystemParameter] == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 // SidecarImageTagParameter selects, for one Cluster, another tag of the sidecar
