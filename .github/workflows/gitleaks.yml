@@ -1,0 +1,14 @@
+# Secret scan of the pull request's commits with gitleaks: the org-wide reusable
+# workflow of maestra-io/github-actions (sha256-pinned CLI, central
+# config). Check name: `gitleaks / gitleaks`. maestra-io/issues-maestra#1568
+name: gitleaks
+
+on: pull_request
+
+permissions:
+  contents: read
+  id-token: write # gitleaks and pinact from nora (packages.maestra.io)
+
+jobs:
+  gitleaks:
+    uses: maestra-io/github-actions/.github/workflows/gitleaks.yml@main
