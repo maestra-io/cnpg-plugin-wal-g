@@ -54,3 +54,31 @@ func TestIsManualBackup(t *testing.T) {
 		t.Error("a scheduled or cluster-owned Backup is not manual")
 	}
 }
+
+func TestIsSidecarReadOnlyRootFilesystem(t *testing.T) {
+	on := map[string]string{SidecarReadOnlyRootFilesystemParameter: "true"}
+	recovery := func(params map[string]string) *cnpgv1.Cluster {
+		return &cnpgv1.Cluster{Spec: cnpgv1.ClusterSpec{
+			Bootstrap: &cnpgv1.BootstrapConfiguration{Recovery: &cnpgv1.BootstrapRecovery{Source: "src"}},
+			ExternalClusters: []cnpgv1.ExternalCluster{{Name: "src",
+				PluginConfiguration: &cnpgv1.PluginConfiguration{Name: PluginNameDeprecated, Parameters: params}}},
+		}}
+	}
+	for _, tc := range []struct {
+		name    string
+		cluster *cnpgv1.Cluster
+		want    bool
+	}{
+		{"no plugin", &cnpgv1.Cluster{}, false},
+		{"no parameter", clusterWithParams(map[string]string{"backupConfig": "x"}), false},
+		{"false", clusterWithParams(map[string]string{SidecarReadOnlyRootFilesystemParameter: "false"}), false},
+		{"True is not true", clusterWithParams(map[string]string{SidecarReadOnlyRootFilesystemParameter: "True"}), false},
+		{"spec.plugins true", clusterWithParams(on), true},
+		{"recovery source true", recovery(on), true},
+		{"recovery source without it", recovery(map[string]string{"backupConfig": "x"}), false},
+	} {
+		if got := IsSidecarReadOnlyRootFilesystem(tc.cluster); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

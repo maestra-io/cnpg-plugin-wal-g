@@ -93,6 +93,28 @@ func GetInitContainerRestartPolicy(cluster *cnpgv1.Cluster) *corev1.ContainerRes
 	}
 }
 
+// SidecarReadOnlyRootFilesystemParameter: "true" runs this Cluster's sidecar
+// with a read-only root filesystem and an emptyDir on /tmp (custom CA bundles
+// and GCS credentials are written there). Any other value or no parameter
+// keeps the writable root, so existing pods do not roll.
+const SidecarReadOnlyRootFilesystemParameter = "sidecarReadOnlyRootFilesystem"
+
+// IsSidecarReadOnlyRootFilesystem reports whether cluster asks for a read-only
+// sidecar root filesystem: SidecarReadOnlyRootFilesystemParameter is "true" in
+// its spec.plugins entry or in the plugin of its recovery source (a Cluster that
+// only restores, such as a backup-verification one, has no spec.plugins entry,
+// and its full-recovery Job still gets the sidecar).
+func IsSidecarReadOnlyRootFilesystem(cluster *cnpgv1.Cluster) bool {
+	for _, pluginConfig := range []*cnpgv1.PluginConfiguration{
+		GetPluginConfigFromCluster(cluster), GetRecoveryPluginConfigFromCluster(cluster),
+	} {
+		if pluginConfig != nil && pluginConfig.Parameters[SidecarReadOnlyRootFilesystemParameter] == "true" {
+			return true
+		}
+	}
+	return false
+}
+
 // SidecarImageTagParameter selects, for one Cluster, another tag of the sidecar
 // image than --cnpg-i-pg-sidecar-image carries (a canary of a new sidecar on one
 // Cluster, without rolling every instance pod of the Kubernetes cluster). Only
